@@ -23,6 +23,11 @@ These rules apply to the main (top-level) session only. If you are a subagent/ex
   - **Opus review (default):** everything else (logic, geometry, hooks/security, or 50+ changed lines). Dispatch `pr-reviewer-N` with no model override.
 - At most 2 review rounds per PR, stated in the brief as `Review round N of 2`. Round 2 is a re-review: give the reviewer the previously reviewed SHA and the round-1 findings so it reviews only the fix diff. If round 2 still returns CHANGES, stop and ask the user before more fixes.
 
+## Main-session Bash (token budget)
+- The main-readonly hook rejects many shell shapes, and each rejection wastes a full-context turn. Allowed: single read commands (`ls`, `cat`, `head`, `wc`, `grep`, `find -name`, `jq`, `sed -n`, `git -C <path> log`), a read command piped into `head`/`grep`/`sort`/`uniq` (`cmd | head`), and `grep -e a -e b`. Rejected: `;`, `&&`, `||`, `>` (incl. `2>/dev/null`), `echo`, `diff`, `python3 -c`, and `$`/`{` expansion. Don't send a rejected shape.
+- Read files with the Read tool. For several independent reads, send several Bash/Read calls in one message: they run in parallel and cost no extra turn.
+- If a read needs a script, `python -c` or a rejected shape, fold it into an executor brief you are already sending, or skip it; dispatch an executor just for a read only when the answer changes what you do next.
+
 ## Enforcement (hooks in ~/.claude/settings.json)
 - `main-readonly.py`: main can't Write/Edit/Bash except plans, memory, and job tmp dirs. Kill switch `CLAUDE_MAIN_WRITE=1`.
 - `task-gate.py`: an Agent dispatch needs an in_progress, unblocked task owned by that `subagent_type`; rejects cycles, in_progress on a blocked task, and one executor owning two in_progress tasks; after a completion it lists ready tasks. Exempt types: web-fetch, claude-code-guide, Explore, Plan. Kill switch `CLAUDE_REQUIRE_TASK=0`.
