@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Live usage</title>
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --fg: #1d1f23;
+    --muted: #6b7079;
+    --grid: #e4e2dc;
+    --panel: #ffffff;
+    --m1: #1f5fbf;
+    --m2: #0f8a6b;
+    --m3: #b4572a;
+    --m4: #8a4fc4;
+    --m5: #b8860b;
+    --m6: #c2185b;
+    --amber: #b26a00;
+    --red: #c62828;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15171b;
+      --fg: #e8e9ec;
+      --muted: #9097a1;
+      --grid: #2c3038;
+      --panel: #1d2026;
+      --m1: #6aa7ff;
+      --m2: #3fd1a6;
+      --m3: #ff9a62;
+      --m4: #c895ff;
+      --m5: #e7c35a;
+      --m6: #f27aa6;
+      --amber: #f0a030;
+      --red: #ff6b5f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15171b;
+    --fg: #e8e9ec;
+    --muted: #9097a1;
+    --grid: #2c3038;
+    --panel: #1d2026;
+    --m1: #6aa7ff;
+    --m2: #3fd1a6;
+    --m3: #ff9a62;
+    --m4: #c895ff;
+    --m5: #e7c35a;
+    --m6: #f27aa6;
+    --amber: #f0a030;
+    --red: #ff6b5f;
+  }
+
+  [hidden] { display: none !important; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 16px; min-width: 0; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 20px 0 6px; }
+  a { color: var(--m1); }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .mono { font-variant-numeric: tabular-nums; }
+  .top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+  .sub { margin: 2px 0 0; }
+
+  .conn { display: inline-flex; align-items: center; gap: 6px; }
+  .conn i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .conn.ok i { background: var(--m2); }
+  .conn.off i { background: var(--muted); }
+
+  .totals { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+  .tot { background: var(--panel); border: 1px solid var(--grid); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+  .tot span { display: block; font-size: 12px; }
+  .tot b { font-size: 20px; font-variant-numeric: tabular-nums; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 4px 0; font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex: 0 0 auto; }
+
+  .chart { width: 100%; min-width: 0; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: hidden; }
+  .chart .grid { stroke: var(--grid); stroke-width: 1; }
+  .chart .tick { font-size: 11px; fill: var(--muted); }
+  .chart .col { fill: transparent; cursor: default; }
+  .chart .col.sel { fill: var(--grid); fill-opacity: 0.55; }
+  .readout { min-height: 3.2em; margin: 4px 0 0; font-size: 13px; word-break: break-word; }
+  .rrow { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 10px; }
+  .card {
+    display: block; min-width: 0; color: inherit; text-decoration: none;
+    background: var(--panel); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px;
+  }
+  .card:hover, .card:focus-visible { border-color: var(--muted); }
+  .card-head { display: flex; align-items: flex-start; gap: 8px; }
+  .ctitle { font-weight: 600; word-break: break-word; min-width: 0; }
+  .card .dot {
+    position: relative; flex: 0 0 auto; width: 9px; height: 9px; margin-top: 6px;
+    border-radius: 50%; background: var(--grid);
+  }
+  .card.is-live .dot { background: var(--m2); }
+  .card.is-live .dot::after {
+    content: ""; position: absolute; inset: -4px; border-radius: 50%;
+    border: 2px solid var(--m2); opacity: 0; animation: pulse 1.6s ease-out infinite;
+  }
+  @keyframes pulse {
+    0% { transform: scale(0.6); opacity: 0.8; }
+    100% { transform: scale(1.6); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .card.is-live .dot::after { animation: none; opacity: 0; }
+  }
+  .ctxrow { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 13px; }
+  .ctxrow span:first-child { color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gauge { height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; margin: 4px 0 8px; }
+  .gauge i { display: block; height: 100%; background: var(--m1); border-radius: 4px; }
+  .gauge.amber i { background: var(--amber); }
+  .gauge.red i { background: var(--red); }
+  .money { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 13px; }
+  .money b { font-variant-numeric: tabular-nums; }
+  .subs { margin: 4px 0 0; padding: 0; list-style: none; font-size: 12px; }
+  .subs li { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 2px 0; border-top: 1px dashed var(--grid); }
+  .sub-label { word-break: break-word; min-width: 0; }
+  /* Not ".seg": the chart's bar rects use that class, and a width rule here would collapse them. */
+  .kind-toggle {
+    display: flex; flex-wrap: wrap; width: fit-content; max-width: 100%;
+    margin: 4px 0; border: 1px solid var(--grid); border-radius: 8px; overflow: hidden;
+  }
+  .kind-toggle button {
+    flex: 0 0 auto; min-height: 36px; padding: 6px 12px; border: 0;
+    background: var(--panel); color: var(--fg); font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .kind-toggle button + button { border-left: 1px solid var(--grid); }
+  .kind-toggle button[aria-pressed="true"] { background: var(--grid); font-weight: 600; }
+  .kind-toggle button:focus-visible { outline: 2px solid var(--m1); outline-offset: -2px; }
+  .foot { margin-top: 18px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header class="top">
+    <div>
+      <h1>Live usage</h1>
+      <p class="muted sub">
+        <span id="conn" class="conn off"><i aria-hidden="true"></i><span id="connText">connecting…</span></span>
+        · <a href="/">Session plots</a>
+      </p>
+    </div>
+    <p id="updated" class="muted small"></p>
+  </header>
+
+  <section class="totals" aria-label="Totals">
+    <div class="tot"><span class="muted">$ today</span><b id="tToday">—</b></div>
+    <div class="tot"><span class="muted">$ last hour</span><b id="tHour">—</b></div>
+    <div class="tot"><span class="muted">output tokens, last hour</span><b id="tOut">—</b></div>
+  </section>
+
+  <h2>Cost per minute (last 60 min)</h2>
+  <div id="legend" class="legend"></div>
+  <section id="chart" class="chart" aria-label="Cost per minute, stacked by model"></section>
+  <p id="readout" class="readout"></p>
+
+  <h2>Tokens per minute (last 60 min)</h2>
+  <div id="tokKind" class="kind-toggle" role="group" aria-label="Token kind">
+    <button type="button" data-kind="all" aria-pressed="true">All</button>
+    <button type="button" data-kind="output" aria-pressed="false">Output</button>
+    <button type="button" data-kind="input" aria-pressed="false">Input</button>
+    <button type="button" data-kind="cacheRead" aria-pressed="false">Cache read</button>
+  </div>
+  <div id="tokLegend" class="legend"></div>
+  <section id="tokChart" class="chart" aria-label="Tokens per minute, stacked by model"></section>
+  <p id="tokReadout" class="readout"></p>
+
+  <h2>Sessions (last 24 h)</h2>
+  <div id="cards" class="cards"><p class="muted">Connecting…</p></div>
+
+  <p class="muted foot">Costs are API-equivalent list prices from pricing.json, not subscription billing.</p>
+</main>
+<script type="module" src="/live.js"></script>
+</body>
+</html>

@@ -3,7 +3,7 @@
 Every test uses temp dirs and env overrides (SESSION_REPO_STATE_DIR,
 RESULT_CAPTURE_LOG, RESULT_CAPTURE_STATE_DIR); nothing touches the real state.
 
-Run: python3 -I -m unittest discover -s hooks/tests -p 'test_sessions_by_repo.py' -v
+Run: python3 -I -m unittest discover -s tests -p 'test_sessions_by_repo.py' -v
 """
 
 import datetime

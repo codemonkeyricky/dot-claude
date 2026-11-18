@@ -1,20 +1,25 @@
-# Allowlist: ignore everything at top level, then un-ignore shareable config only
+# Allowlist: ignore everything at top level, then un-ignore the repo files and the harness dir
 /*
 !/.gitignore
 !/README.md
 !/deploy.sh
-!/CLAUDE.md
-!/settings.json
-!/keybindings.json
-!/agents/
-!/hooks/
-!/commands/
-!/scripts/
-!/output-styles/
-!/statusline*
+!/.claude/
+!/tools/
+
+# Inside .claude/: ignore everything, then un-ignore the shareable harness config only
+/.claude/*
+!/.claude/CLAUDE.md
+!/.claude/settings.harness.json
+!/.claude/keybindings.json
+!/.claude/agents/
+!/.claude/hooks/
+!/.claude/commands/
+!/.claude/scripts/
+!/.claude/output-styles/
+!/.claude/statusline*
 
 # Re-ignore inside allowed dirs
-hooks/state/
+.claude/hooks/state/
 **/node_modules/
 **/__pycache__/
 *.pyc
@@ -28,7 +33,8 @@ hooks/state/
 **/*.png
 **/*.jpg
 **/tmp/
-hooks/*.local.json
+.claude/hooks/*.local.json
+tools/**/out/
 
 # Never track (explicit, belt and braces)
 .credentials.json
