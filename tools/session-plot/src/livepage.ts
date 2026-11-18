@@ -1,16 +1,22 @@
-// Browser client for /live. No external libraries; the chart is hand-built SVG.
+// Browser client for /live. No external libraries; the charts are hand-built SVG.
+import { isTokenKind, minuteTokens, minuteTokenTotal, TOKEN_KIND_LABELS, type TokenKind } from "./tokens";
 import type { LiveMinute, LiveSession, LiveSnapshot } from "./types";
 
 const CTX_LIMIT = 200_000;
 const LIVE_SEC = 120;
 const MODEL_VARS = ["--m1", "--m2", "--m3", "--m4", "--m5", "--m6"];
 const USD_STEPS = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+const TOKEN_STEPS = [
+  1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6, 2e6, 5e6, 1e7, 2e7, 5e7, 1e8, 2e8, 5e8, 1e9, 2e9, 5e9, 1e10,
+];
+const KIND_KEY = "session-plot.tokenKind";
 const ESC: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
 let snap: LiveSnapshot | null = null;
 let serverOffset = 0; // server clock minus local clock, ms
-let selectedT: number | null = null; // minute (epoch ms) shown in the readout
+let selectedT: number | null = null; // minute (epoch ms) shown in the readouts of both charts
 let models: string[] = [];
+let tokenKind: TokenKind = loadTokenKind();
 
 function $<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -43,6 +49,15 @@ function tokens(n: number): string {
   return String(Math.round(n));
 }
 
+// Axis label: short, in k or M, without trailing zeros (500k, 1.5M).
+function tickTokens(v: number): string {
+  const trim = (x: number): string => String(Number(x.toFixed(2)));
+  if (v === 0) return "0";
+  if (v >= 1e6) return `${trim(v / 1e6)}M`;
+  if (v >= 1e3) return `${trim(v / 1e3)}k`;
+  return String(Math.round(v));
+}
+
 function kTok(n: number): string {
   return `${Math.round(n / 1000)}k`;
 }
@@ -69,10 +84,25 @@ function colorOf(model: string): string {
   return `var(${MODEL_VARS[(i < 0 ? 0 : i) % MODEL_VARS.length]})`;
 }
 
-function minuteCost(m: LiveMinute): number {
-  let total = 0;
-  for (const v of Object.values(m.byModel)) total += v.cost;
-  return total;
+function loadTokenKind(): TokenKind {
+  try {
+    const v = localStorage.getItem(KIND_KEY);
+    return isTokenKind(v) ? v : "all";
+  } catch {
+    return "all"; // storage blocked or unavailable: use the default for this page only
+  }
+}
+
+function saveTokenKind(k: TokenKind): void {
+  try {
+    localStorage.setItem(KIND_KEY, k);
+  } catch {
+    // Not persisted; the choice still applies until the page reloads.
+  }
+}
+
+function costsOf(m: LiveMinute): Record<string, number> {
+  return Object.fromEntries(Object.entries(m.byModel).map(([model, v]) => [model, v.cost]));
 }
 
 function collectModels(s: LiveSnapshot): string[] {
@@ -89,56 +119,68 @@ function renderTotals(s: LiveSnapshot): void {
 }
 
 function renderLegend(): void {
-  $<HTMLElement>("legend").innerHTML =
+  const html =
     models.length === 0
       ? `<span class="muted">no model activity in the last hour</span>`
       : models.map((m) => `<span><i class="sw" style="background:${colorOf(m)}"></i>${esc(m)}</span>`).join("");
+  $<HTMLElement>("legend").innerHTML = html;
+  $<HTMLElement>("tokLegend").innerHTML = html;
 }
 
-function renderChart(s: LiveSnapshot): void {
-  const box = $<HTMLElement>("chart");
+interface ChartSpec {
+  box: HTMLElement;
+  label: string; // aria label of the SVG
+  values: (m: LiveMinute) => Record<string, number>; // per-model value of one minute
+  steps: number[]; // allowed nice tick steps
+  fmtTick: (v: number, step: number) => string;
+  fmtValue: (v: number) => string; // hover tooltip text
+}
+
+// Stacked bars, one per minute, in the shared model order. Empty minutes and zero segments draw nothing.
+function drawStacked(spec: ChartSpec, s: LiveSnapshot): void {
+  const box = spec.box;
   const W = Math.max(280, Math.round(box.clientWidth || 343));
   const H = 220;
-  const LEFT = 44;
+  const LEFT = 52;
   const RIGHT = 8;
   const TOP = 10;
   const BOTTOM = 24;
   const plotW = W - LEFT - RIGHT;
   const plotH = H - TOP - BOTTOM;
   const n = s.perMinute.length;
-  const maxCost = Math.max(0, ...s.perMinute.map(minuteCost));
-  const step = niceStep(maxCost * 1.1, 4, USD_STEPS);
-  const yMax = Math.max(step, Math.ceil((maxCost * 1.1) / step) * step);
+  const perMin = s.perMinute.map((m) => spec.values(m));
+  let maxV = 0;
+  for (const v of perMin) maxV = Math.max(maxV, Object.values(v).reduce((a, b) => a + b, 0));
+  const step = niceStep(maxV * 1.1, 4, spec.steps);
+  const yMax = Math.max(step, Math.ceil((maxV * 1.1) / step) * step);
   const Y = (v: number): number => TOP + plotH - (v / yMax) * plotH;
   const slot = plotW / n;
   const bw = Math.max(2, slot * 0.72);
 
   const out: string[] = [];
-  out.push(
-    `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Cost per minute, last 60 minutes, by model">`,
-  );
+  out.push(`<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(spec.label)}">`);
   const nY = Math.round(yMax / step);
-  const dec = Number.isInteger(step) ? 0 : 2; // 0.5 steps need two decimals; whole steps need none
   for (let i = 0; i <= nY; i++) {
     const v = i * step;
     const y = Y(v).toFixed(1);
     out.push(`<line class="grid" x1="${LEFT}" x2="${W - RIGHT}" y1="${y}" y2="${y}"/>`);
     out.push(
-      `<text class="tick" x="${LEFT - 6}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">$${v.toFixed(dec)}</text>`,
+      `<text class="tick" x="${LEFT - 6}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${esc(spec.fmtTick(v, step))}</text>`,
     );
   }
 
   s.perMinute.forEach((m, i) => {
     const x = LEFT + i * slot + (slot - bw) / 2;
+    const vals = perMin[i];
     let acc = 0;
     for (const model of models) {
-      const v = m.byModel[model]?.cost ?? 0;
+      const v = vals[model] ?? 0;
       if (v <= 0) continue;
       const y0 = Y(acc);
       acc += v;
       const y1 = Y(acc);
       out.push(
-        `<rect class="seg" x="${x.toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0.5, y0 - y1).toFixed(1)}" style="fill:${colorOf(model)}"><title>${esc(hhmm(m.t))} ${esc(model)} ${usd(v)}</title></rect>`,
+        `<rect class="seg" x="${x.toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0.5, y0 - y1).toFixed(1)}" style="fill:${colorOf(model)}"><title>${esc(hhmm(m.t))} ${esc(model)} ${esc(spec.fmtValue(v))}</title></rect>`,
       );
     }
   });
@@ -161,6 +203,33 @@ function renderChart(s: LiveSnapshot): void {
   box.innerHTML = out.join("");
 }
 
+const costSpec = (): ChartSpec => ({
+  box: $<HTMLElement>("chart"),
+  label: "Cost per minute, last 60 minutes, by model",
+  values: costsOf,
+  steps: USD_STEPS,
+  fmtTick: (v, step) => `$${v.toFixed(Number.isInteger(step) ? 0 : 2)}`, // 0.5 steps need two decimals
+  fmtValue: usd,
+});
+
+const tokenSpec = (): ChartSpec => ({
+  box: $<HTMLElement>("tokChart"),
+  label: `Tokens per minute (${TOKEN_KIND_LABELS[tokenKind].toLowerCase()}), last 60 minutes, by model`,
+  values: (m) => minuteTokens(m, tokenKind),
+  steps: TOKEN_STEPS,
+  fmtTick: (v) => tickTokens(v),
+  fmtValue: tokens,
+});
+
+function renderChart(s: LiveSnapshot): void {
+  drawStacked(costSpec(), s);
+}
+
+function renderTokens(s: LiveSnapshot): void {
+  drawStacked(tokenSpec(), s);
+  renderTokReadout(s);
+}
+
 function renderReadout(s: LiveSnapshot): void {
   const el = $<HTMLElement>("readout");
   const m = s.perMinute.find((x) => x.t === selectedT);
@@ -180,6 +249,30 @@ function renderReadout(s: LiveSnapshot): void {
       ` · out ${tokens(v.out)} · in ${tokens(v.in)} · cache write ${tokens(v.cacheWrite)} · read ${tokens(v.cacheRead)}</span>`,
   );
   el.innerHTML = `<strong>${hhmm(m.t)}</strong> · ${usd(total)}<br>${lines.join("<br>")}`;
+}
+
+// Per-model token counts for the selected minute and the selected kind.
+function renderTokReadout(s: LiveSnapshot): void {
+  const el = $<HTMLElement>("tokReadout");
+  const m = s.perMinute.find((x) => x.t === selectedT);
+  if (!m) {
+    el.textContent = "";
+    return;
+  }
+  const label = TOKEN_KIND_LABELS[tokenKind].toLowerCase();
+  const rows = Object.entries(minuteTokens(m, tokenKind))
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1]);
+  if (rows.length === 0) {
+    el.innerHTML = `<strong>${hhmm(m.t)}</strong> · no ${esc(label)} tokens`;
+    return;
+  }
+  const total = minuteTokenTotal(m, tokenKind);
+  const lines = rows.map(
+    ([model, v]) =>
+      `<span class="rrow"><i class="sw" style="background:${colorOf(model)}"></i>${esc(model)} ${tokens(v)}</span>`,
+  );
+  el.innerHTML = `<strong>${hhmm(m.t)}</strong> · ${tokens(total)} ${esc(label)} tokens<br>${lines.join("<br>")}`;
 }
 
 function renderCards(s: LiveSnapshot): void {
@@ -233,25 +326,36 @@ function setConn(ok: boolean): void {
   $<HTMLElement>("connText").textContent = ok ? "connected" : "reconnecting…";
 }
 
+// Hovering or tapping a minute on either chart selects it on both.
 function selectMinute(target: EventTarget | null): void {
   const el = (target as Element | null)?.closest?.("[data-t]");
   if (!el || !snap) return;
   const t = Number(el.getAttribute("data-t"));
   if (t === selectedT) return;
   selectedT = t;
-  document.querySelectorAll<Element>("#chart .col").forEach((c) => {
+  document.querySelectorAll<Element>(".chart .col").forEach((c) => {
     c.classList.toggle("sel", Number(c.getAttribute("data-t")) === selectedT);
   });
   renderReadout(snap);
+  renderTokReadout(snap);
+}
+
+function updateKindButtons(): void {
+  document.querySelectorAll<HTMLButtonElement>("#tokKind button[data-kind]").forEach((b) => {
+    b.setAttribute("aria-pressed", String(b.dataset.kind === tokenKind));
+  });
 }
 
 function render(s: LiveSnapshot): void {
   snap = s;
   models = collectModels(s);
+  // The selected minute can leave the 60-minute window; then fall back to the newest minute.
+  if (selectedT !== null && !s.perMinute.some((m) => m.t === selectedT)) selectedT = null;
   if (selectedT === null && s.perMinute.length > 0) selectedT = s.perMinute[s.perMinute.length - 1].t;
   renderTotals(s);
   renderLegend();
   renderChart(s);
+  renderTokens(s);
   renderReadout(s);
   renderCards(s);
   tick();
@@ -271,17 +375,37 @@ function connect(): void {
 }
 
 const chartEl = $<HTMLElement>("chart");
-chartEl.addEventListener("pointerover", (e) => selectMinute(e.target));
-chartEl.addEventListener("pointerdown", (e) => selectMinute(e.target));
+const tokChartEl = $<HTMLElement>("tokChart");
+for (const el of [chartEl, tokChartEl]) {
+  el.addEventListener("pointerover", (e) => selectMinute(e.target));
+  el.addEventListener("pointerdown", (e) => selectMinute(e.target));
+}
+
+$<HTMLElement>("tokKind").addEventListener("click", (e) => {
+  const btn = (e.target as Element | null)?.closest?.("button[data-kind]") as HTMLButtonElement | null;
+  const k = btn?.dataset.kind;
+  if (!isTokenKind(k) || k === tokenKind) return;
+  tokenKind = k;
+  saveTokenKind(k);
+  updateKindButtons();
+  if (snap) renderTokens(snap);
+});
+updateKindButtons();
 
 let lastWidth = 0;
 const redraw = (): void => {
   if (!snap || chartEl.clientWidth === lastWidth) return;
   lastWidth = chartEl.clientWidth;
   renderChart(snap);
+  renderTokens(snap);
 };
-if (typeof ResizeObserver !== "undefined") new ResizeObserver(redraw).observe(chartEl);
-else window.addEventListener("resize", redraw);
+if (typeof ResizeObserver !== "undefined") {
+  const ro = new ResizeObserver(redraw);
+  ro.observe(chartEl);
+  ro.observe(tokChartEl);
+} else {
+  window.addEventListener("resize", redraw);
+}
 
 setInterval(tick, 1000);
 connect();

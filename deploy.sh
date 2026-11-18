@@ -18,8 +18,13 @@
 set -euo pipefail
 
 # CLAUDE_DIR is relative to the caller's working directory, so resolve it to an absolute path
-# before the cd calls below move us into the repo.
+# before the cd calls below move us into the repo. A leading ~ or ~/ means $HOME (the shell does
+# not expand a tilde that comes from a variable's value).
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+case "$CLAUDE_DIR" in
+  "~") CLAUDE_DIR="$HOME" ;;
+  "~/"*) CLAUDE_DIR="$HOME/${CLAUDE_DIR#"~/"}" ;;
+esac
 case "$CLAUDE_DIR" in
   /*) ;;
   *) CLAUDE_DIR="$PWD/$CLAUDE_DIR" ;;

@@ -132,6 +132,18 @@
   .subs { margin: 4px 0 0; padding: 0; list-style: none; font-size: 12px; }
   .subs li { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 2px 0; border-top: 1px dashed var(--grid); }
   .sub-label { word-break: break-word; min-width: 0; }
+  /* Not ".seg": the chart's bar rects use that class, and a width rule here would collapse them. */
+  .kind-toggle {
+    display: flex; flex-wrap: wrap; width: fit-content; max-width: 100%;
+    margin: 4px 0; border: 1px solid var(--grid); border-radius: 8px; overflow: hidden;
+  }
+  .kind-toggle button {
+    flex: 0 0 auto; min-height: 36px; padding: 6px 12px; border: 0;
+    background: var(--panel); color: var(--fg); font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .kind-toggle button + button { border-left: 1px solid var(--grid); }
+  .kind-toggle button[aria-pressed="true"] { background: var(--grid); font-weight: 600; }
+  .kind-toggle button:focus-visible { outline: 2px solid var(--m1); outline-offset: -2px; }
   .foot { margin-top: 18px; font-size: 12px; }
 </style>
 </head>
@@ -158,6 +170,17 @@
   <div id="legend" class="legend"></div>
   <section id="chart" class="chart" aria-label="Cost per minute, stacked by model"></section>
   <p id="readout" class="readout"></p>
+
+  <h2>Tokens per minute (last 60 min)</h2>
+  <div id="tokKind" class="kind-toggle" role="group" aria-label="Token kind">
+    <button type="button" data-kind="all" aria-pressed="true">All</button>
+    <button type="button" data-kind="output" aria-pressed="false">Output</button>
+    <button type="button" data-kind="input" aria-pressed="false">Input</button>
+    <button type="button" data-kind="cacheRead" aria-pressed="false">Cache read</button>
+  </div>
+  <div id="tokLegend" class="legend"></div>
+  <section id="tokChart" class="chart" aria-label="Tokens per minute, stacked by model"></section>
+  <p id="tokReadout" class="readout"></p>
 
   <h2>Sessions (last 24 h)</h2>
   <div id="cards" class="cards"><p class="muted">Connecting…</p></div>

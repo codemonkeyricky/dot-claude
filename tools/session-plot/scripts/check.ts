@@ -59,10 +59,9 @@ for (const line of readFileSync(file, "utf8").split("\n")) {
 if (!pick) throw new Error("no priced assistant turn found");
 
 const u = pick.usage;
-const key = pricing.models[pick.model as keyof typeof pricing.models]
-  ? pick.model
-  : pick.model.replace(/-\d{8}$/, "");
-const p = (pricing.models as Record<string, any>)[key];
+// Same rate lookup as turnCost (exact key, dated suffix stripped, then longest prefix).
+const p = priceFor(pick.model);
+if (!p) throw new Error(`no rates for ${pick.model}`);
 const input = u.input_tokens ?? 0;
 const cc = u.cache_creation_input_tokens ?? 0;
 const cr = u.cache_read_input_tokens ?? 0;
@@ -93,7 +92,7 @@ const computed = turnCost(pick.model, u).usd;
 
 console.log("--- hand-verified turn ---");
 console.log(`message id: ${pick.msgId}`);
-console.log(`model: ${pick.model} (rates key ${key})`);
+console.log(`model: ${pick.model}`);
 console.log(`usage: ${JSON.stringify(u)}`);
 console.log(
   `rates per M: in ${rIn}, out ${rOut}, cacheRead ${rCr}; write5m x${pricing.cacheWrite5mMult}, write1h x${pricing.cacheWrite1hMult}`,

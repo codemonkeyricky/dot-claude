@@ -1,12 +1,30 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, closeSync, mkdirSync, mkdtempSync, openSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LiveIndex } from "../src/live";
+import { turnCost } from "../src/cost";
 
 const SID = "aaaaaaaa-0000-0000-0000-000000000001";
 const PROJ = "proj-a";
+const DAY = 24 * 3_600_000;
+const MODEL = "claude-opus-5-5";
+
+function usageOf(input: number) {
+  return { input_tokens: input, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+}
 
 function usageLine(msgId: string, input: number, ts: string = new Date().toISOString()): string {
   return (
@@ -16,8 +34,8 @@ function usageLine(msgId: string, input: number, ts: string = new Date().toISOSt
       uuid: `uuid-${msgId}`,
       message: {
         id: msgId,
-        model: "claude-opus-5-5",
-        usage: { input_tokens: input, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        model: MODEL,
+        usage: usageOf(input),
       },
     }) + "\n"
   );
@@ -148,15 +166,142 @@ test("timestamp comes from the parsed line, not from a nested timestamp in tool 
         type: "assistant",
         message: {
           id: "nested",
-          model: "claude-opus-5-5",
+          model: MODEL,
           content: [{ type: "tool_use", id: "tu", name: "Probe", input: { timestamp: "2001-01-01T00:00:00.000Z" } }],
-          usage: { input_tokens: 5, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+          usage: usageOf(5),
         },
         timestamp: now,
       }) + "\n";
     writeFileSync(file, line);
     const s = sessionOf(idx);
     assert.equal(s.lastActivity, Date.parse(now));
+  } finally {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pruning per-message records leaves the all-time turns, peak and subagent cost unchanged", () => {
+  const { root, dir, file } = fixture();
+  const subDir = join(dir, SID, "subagents");
+  mkdirSync(subDir, { recursive: true });
+  const subFile = join(subDir, "agent-sub2.jsonl");
+  const oldTs = new Date(Date.now() - 2 * DAY).toISOString();
+  writeFileSync(file, usageLine("old-main", 1000, oldTs) + usageLine("new-main", 5000));
+  writeFileSync(subFile, usageLine("old-sub", 300, oldTs) + usageLine("new-sub", 700));
+  const idx = new LiveIndex(root);
+  try {
+    const expectedSub = turnCost(MODEL, usageOf(300)).usd + turnCost(MODEL, usageOf(700)).usd;
+
+    const s1 = sessionOf(idx);
+    assert.equal(s1.mainTurns, 2);
+    assert.equal(s1.mainPeakCtx, 5000);
+    assert.equal(s1.activeSubagents.length, 1);
+    assert.ok(Math.abs(s1.activeSubagents[0].costUsd - expectedSub) < 1e-12);
+    // The windowed store holds only the recent main message; the old one is still in the summary.
+    assert.equal((idx as any).files.get(file).msgs.size, 1);
+
+    appendFileSync(file, usageLine("later-main", 3000));
+    const s2 = sessionOf(idx);
+    assert.equal(s2.mainTurns, 3);
+    assert.equal(s2.mainPeakCtx, 5000);
+    assert.ok(Math.abs(s2.activeSubagents[0].costUsd - expectedSub) < 1e-12);
+  } finally {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an idle main transcript is kept while a subagent is active, and a poll does not re-read it", () => {
+  const { root, dir, file } = fixture();
+  const subDir = join(dir, SID, "subagents");
+  mkdirSync(subDir, { recursive: true });
+  const subFile = join(subDir, "agent-sub3.jsonl");
+  const old = new Date(Date.now() - 2 * DAY);
+  writeFileSync(file, customTitleLine("Idle main") + usageLine("main1", 4000, old.toISOString()));
+  utimesSync(file, old, old);
+  writeFileSync(subFile, usageLine("sub1", 700));
+  const idx = new LiveIndex(root);
+  try {
+    const s1 = sessionOf(idx);
+    assert.equal(s1.title, "Idle main");
+    assert.equal(s1.mainTurns, 1);
+    assert.equal(s1.mainCtx, 4000);
+    assert.equal(s1.mainModel, MODEL);
+    assert.equal(s1.activeSubagents.length, 1);
+
+    const mainState = (idx as any).files.get(file);
+    assert.ok(mainState, "the main transcript stays tracked while its session is live");
+    const offset = mainState.offset;
+    // A poll with nothing new reports no changed sessions and does not re-read the main file.
+    assert.deepEqual((idx as any).walk(Date.now() - DAY), []);
+    assert.equal(mainState.offset, offset);
+
+    const s2 = sessionOf(idx);
+    assert.equal(s2.title, "Idle main");
+    assert.equal(s2.mainTurns, 1);
+    assert.equal(s2.mainCtx, 4000);
+    assert.equal(s2.mainModel, MODEL);
+  } finally {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a session whose files are all older than 24 h is dropped and not re-added by a poll", () => {
+  const { root, file } = fixture();
+  writeFileSync(file, usageLine("m1", 100));
+  const idx = new LiveIndex(root);
+  try {
+    assert.equal(idx.sessionCount(), 1);
+    const old = new Date(Date.now() - 2 * DAY);
+    utimesSync(file, old, old);
+    idx.refreshNow();
+    assert.equal(idx.sessionCount(), 0);
+    assert.equal(idx.fileCount(), 0);
+
+    idx.refreshNow();
+    assert.equal(idx.sessionCount(), 0);
+    assert.equal(idx.fileCount(), 0);
+  } finally {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("deleting a tracked transcript between polls does not throw and forgets it", () => {
+  const { root, file } = fixture();
+  writeFileSync(file, usageLine("m1", 100));
+  const idx = new LiveIndex(root);
+  try {
+    assert.equal(idx.fileCount(), 1);
+    unlinkSync(file);
+    const snap = idx.refreshNow();
+    assert.equal(idx.fileCount(), 0);
+    assert.equal(idx.sessionCount(), 0);
+    assert.equal(snap.sessions.length, 0);
+  } finally {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a synthetic <...> placeholder is not the session's latest model or context", () => {
+  const { root, file } = fixture();
+  const idx = new LiveIndex(root);
+  try {
+    const later = new Date(Date.now() + 1000).toISOString();
+    const synthetic =
+      JSON.stringify({
+        type: "assistant",
+        timestamp: later,
+        uuid: "uuid-synth",
+        message: { id: "synth", model: "<synthetic>", usage: usageOf(0) },
+      }) + "\n";
+    writeFileSync(file, usageLine("real", 1234) + synthetic);
+    const s = sessionOf(idx);
+    assert.equal(s.mainModel, MODEL);
+    assert.equal(s.mainCtx, 1234);
   } finally {
     idx.close();
     rmSync(root, { recursive: true, force: true });

@@ -35,6 +35,7 @@ const WINDOW_MIN = 60;
 const DEBOUNCE_MS = 1000;
 const POLL_MS = 2000;
 
+// Per-message record, kept only while the message is inside the 24 h window (windowed totals).
 interface Msg {
   t: number; // first-seen timestamp of this message id
   model: string;
@@ -44,6 +45,21 @@ interface Msg {
   out: number;
   ctx: number; // in + cw + cr
   usd: number;
+}
+
+// All-time record per message id. Never pruned while the file's session is live, so turns,
+// peak context and cost do not change when old messages leave the window.
+interface Seen {
+  t: number;
+  model: string;
+  usd: number;
+  ctx: number;
+}
+
+interface Last {
+  t: number;
+  model: string;
+  ctx: number;
 }
 
 interface FileState {
@@ -56,7 +72,11 @@ interface FileState {
   mtime: number; // epoch ms at the last read
   offset: number; // bytes consumed so far
   partial: Buffer; // trailing bytes without a newline yet
-  msgs: Map<string, Msg>;
+  msgs: Map<string, Msg>; // windowed per-message records (pruned to the 24 h window)
+  seen: Map<string, Seen>; // all-time per-message records (dedupe, turns, cost)
+  totalUsd: number; // all-time cost of this file
+  peakCtx: number; // all-time peak context
+  last: Last | null; // newest non-synthetic assistant message
   lastActivity: number; // epoch ms, newest timestamp seen
   anon: number;
   custom?: string; // last custom-title seen
@@ -97,10 +117,11 @@ function locate(root: string, path: string): Locator | null {
   return null;
 }
 
-function latestOf(msgs: Map<string, Msg>): Msg | null {
-  let latest: Msg | null = null;
-  for (const m of msgs.values()) if (!latest || m.t >= latest.t) latest = m;
-  return latest;
+function sessionFiles(sess: SessionRec): FileState[] {
+  const files: FileState[] = [];
+  if (sess.main) files.push(sess.main);
+  for (const f of sess.subs.values()) files.push(f);
+  return files;
 }
 
 export class LiveIndex extends EventEmitter {
@@ -124,6 +145,7 @@ export class LiveIndex extends EventEmitter {
     // Start watching before the scan so nothing written during the scan is missed.
     this.startWatching();
     this.walk(Date.now() - DAY);
+    this.prune();
     this.latest = this.compute();
     this.firstSnapshotMs = performance.now() - t0;
   }
@@ -223,28 +245,36 @@ export class LiveIndex extends EventEmitter {
     this.emit("update", update);
   }
 
-  // Keeps memory bounded to the 24 h window: messages older than the cutoff are dropped, files
-  // that are older than the cutoff and have nothing left are forgotten, and sessions with no
-  // files left are removed. A forgotten file is read again from the start if it is written to.
+  // Keeps memory bounded to the 24 h window. Only the per-message records (msgs) older than the
+  // cutoff are dropped; the all-time summary (seen, totals, peak, last message) stays while the
+  // session is live. A session is live while any of its files was written inside the window, and
+  // all of its files are kept with it. A session whose files are all older than the cutoff is
+  // dropped, and walk() does not re-add it because its files are out of window and untracked.
   private prune(): void {
     const cutoff = Date.now() - DAY;
-    for (const [path, st] of this.files) {
+    for (const st of this.files.values()) {
       for (const [key, m] of st.msgs) if (m.t < cutoff) st.msgs.delete(key);
-      if (st.mtime < cutoff && st.msgs.size === 0) {
-        this.files.delete(path);
-        const sess = this.sessions.get(`${st.projectDir}/${st.sessionId}`);
-        if (sess) {
-          if (st.agentId === null) {
-            if (sess.main === st) sess.main = null;
-          } else if (sess.subs.get(st.agentId) === st) {
-            sess.subs.delete(st.agentId);
-          }
-        }
-      }
     }
     for (const [key, sess] of this.sessions) {
-      if (sess.main === null && sess.subs.size === 0) this.sessions.delete(key);
+      const files = sessionFiles(sess);
+      if (files.some((f) => f.mtime >= cutoff)) continue;
+      for (const f of files) this.files.delete(f.path);
+      this.sessions.delete(key);
     }
+  }
+
+  // Drops the state of one file that was deleted or replaced under us, and its session once empty.
+  private forget(st: FileState): void {
+    this.files.delete(st.path);
+    const key = `${st.projectDir}/${st.sessionId}`;
+    const sess = this.sessions.get(key);
+    if (!sess) return;
+    if (st.agentId === null) {
+      if (sess.main === st) sess.main = null;
+    } else if (sess.subs.get(st.agentId) === st) {
+      sess.subs.delete(st.agentId);
+    }
+    if (sess.main === null && sess.subs.size === 0) this.sessions.delete(key);
   }
 
   // Scans the projects tree. Files older than cutoff are skipped unless already tracked, or
@@ -252,6 +282,8 @@ export class LiveIndex extends EventEmitter {
   // Returns the session ids whose state changed.
   private walk(cutoff: number): string[] {
     const changed = new Set<string>();
+    // Every transcript the scan lists. A tracked file that is not listed any more was deleted.
+    const listed = new Set<string>();
     let dirs: string[];
     try {
       dirs = readdirSync(this.root);
@@ -264,31 +296,43 @@ export class LiveIndex extends EventEmitter {
       try {
         entries = readdirSync(pdir);
       } catch {
-        continue; // not a directory
+        continue; // not a directory, or removed during the scan
       }
       for (const name of entries) {
         if (!name.endsWith(".jsonl")) continue;
         const sid = name.slice(0, -".jsonl".length);
         let subRecent = false;
         const subDir = join(pdir, sid, "subagents");
-        if (existsSync(subDir)) {
-          for (const f of readdirSync(subDir)) {
-            if (!/^agent-.+\.jsonl$/.test(f)) continue;
-            const p = join(subDir, f);
-            const recent = this.mtimeOf(p) >= cutoff;
-            if (recent) subRecent = true;
-            if (recent || this.files.has(p)) {
-              const got = this.ingestPath(p);
-              if (got) changed.add(got);
-            }
+        let subFiles: string[] = [];
+        try {
+          subFiles = readdirSync(subDir);
+        } catch {
+          // No subagents directory (or it went away during the scan).
+        }
+        for (const f of subFiles) {
+          if (!/^agent-.+\.jsonl$/.test(f)) continue;
+          const p = join(subDir, f);
+          listed.add(p);
+          const recent = this.mtimeOf(p) >= cutoff;
+          if (recent) subRecent = true;
+          if (recent || this.files.has(p)) {
+            const got = this.ingestPath(p);
+            if (got) changed.add(got);
           }
         }
         const mainPath = join(pdir, name);
+        listed.add(mainPath);
         if (subRecent || this.mtimeOf(mainPath) >= cutoff || this.files.has(mainPath)) {
           const got = this.ingestPath(mainPath);
           if (got) changed.add(got);
         }
       }
+    }
+    // Forget tracked files the scan no longer lists (deleted, or their project directory went away).
+    for (const [path, st] of [...this.files]) {
+      if (listed.has(path)) continue;
+      this.forget(st);
+      changed.add(st.sessionId);
     }
     return [...changed];
   }
@@ -302,6 +346,7 @@ export class LiveIndex extends EventEmitter {
   }
 
   // Reads new bytes of one transcript. Returns its session id when state changed, else null.
+  // A file that is gone (or changes shape under the read) has its state dropped, not an error.
   private ingestPath(path: string): string | null {
     const loc = locate(this.root, path);
     if (!loc) return null;
@@ -309,11 +354,21 @@ export class LiveIndex extends EventEmitter {
     try {
       stat = statSync(path);
     } catch {
-      return null;
+      const gone = this.files.get(path);
+      if (!gone) return null;
+      this.forget(gone);
+      return gone.sessionId;
     }
     let st = this.files.get(path);
     if (!st) st = this.newFile(path, loc, stat);
-    return this.readNew(st, stat) ? st.sessionId : null;
+    try {
+      return this.readNew(st, stat) ? st.sessionId : null;
+    } catch {
+      // ENOENT, ENOTDIR or a read error between stat and open: forget it. A later walk or
+      // watch event starts it over from the beginning if the file is back.
+      this.forget(st);
+      return st.sessionId;
+    }
   }
 
   private newFile(path: string, loc: Locator, stat: Stats): FileState {
@@ -328,6 +383,10 @@ export class LiveIndex extends EventEmitter {
       offset: 0,
       partial: Buffer.alloc(0),
       msgs: new Map(),
+      seen: new Map(),
+      totalUsd: 0,
+      peakCtx: 0,
+      last: null,
       lastActivity: 0,
       anon: 0,
       label: loc.agentId ?? "main",
@@ -358,6 +417,10 @@ export class LiveIndex extends EventEmitter {
       st.offset = 0;
       st.partial = Buffer.alloc(0);
       st.msgs.clear();
+      st.seen.clear();
+      st.totalUsd = 0;
+      st.peakCtx = 0;
+      st.last = null;
       st.lastActivity = 0;
       st.anon = 0;
       st.custom = undefined;
@@ -437,21 +500,25 @@ export class LiveIndex extends EventEmitter {
 
     // Same message id repeats on several lines: keep the last usage, the first timestamp.
     const key = typeof msg.id === "string" ? msg.id : typeof o.uuid === "string" ? o.uuid : `anon-${st.anon++}`;
-    const prev = st.msgs.get(key);
+    const prev = st.seen.get(key);
     const model = typeof msg.model === "string" && msg.model ? msg.model : (prev?.model ?? "");
+    const t = prev?.t ?? ts;
     const input = num(usage.input_tokens);
     const cw = num(usage.cache_creation_input_tokens);
     const cr = num(usage.cache_read_input_tokens);
-    st.msgs.set(key, {
-      t: prev?.t ?? ts,
-      model,
-      in: input,
-      cw,
-      cr,
-      out: num(usage.output_tokens),
-      ctx: input + cw + cr,
-      usd: turnCost(model, usage).usd,
-    });
+    const out = num(usage.output_tokens);
+    const ctx = input + cw + cr;
+    const usd = turnCost(model, usage).usd;
+
+    // All-time summary: replaces this id's previous usage, so repeated lines count once.
+    st.seen.set(key, { t, model, usd, ctx });
+    st.totalUsd += usd - (prev?.usd ?? 0);
+    if (ctx > st.peakCtx) st.peakCtx = ctx;
+    // Synthetic placeholders (model "<...>") never become the session's latest message.
+    if (!model.startsWith("<") && (st.last === null || t >= st.last.t)) st.last = { t, model, ctx };
+
+    // Windowed record: only messages inside the 24 h window are kept per message.
+    if (t >= Date.now() - DAY) st.msgs.set(key, { t, model, in: input, cw, cr, out, ctx, usd });
   }
 
   private loadMeta(st: FileState): void {
@@ -480,9 +547,7 @@ export class LiveIndex extends EventEmitter {
     const sessions: LiveSession[] = [];
 
     for (const sess of this.sessions.values()) {
-      const files: FileState[] = [];
-      if (sess.main) files.push(sess.main);
-      for (const f of sess.subs.values()) files.push(f);
+      const files = sessionFiles(sess);
       let lastActivity = 0;
       for (const f of files) lastActivity = Math.max(lastActivity, f.lastActivity);
       if (lastActivity < dayAgo) continue;
@@ -520,29 +585,25 @@ export class LiveIndex extends EventEmitter {
       let mainPeakCtx = 0;
       let mainTurns = 0;
       if (sess.main) {
-        mainTurns = sess.main.msgs.size;
-        for (const m of sess.main.msgs.values()) if (m.ctx > mainPeakCtx) mainPeakCtx = m.ctx;
-        const latest = latestOf(sess.main.msgs);
-        if (latest) {
-          mainCtx = latest.ctx;
-          mainModel = latest.model || undefined;
+        mainTurns = sess.main.seen.size;
+        mainPeakCtx = sess.main.peakCtx;
+        if (sess.main.last) {
+          mainCtx = sess.main.last.ctx;
+          mainModel = sess.main.last.model || undefined;
         }
       }
 
       const activeSubagents: LiveSubagent[] = [];
       for (const f of sess.subs.values()) {
         if (f.lastActivity < now - ACTIVE_MS || f.agentId === null) continue;
-        let costUsd = 0;
-        for (const m of f.msgs.values()) costUsd += m.usd;
-        const latest = latestOf(f.msgs);
         activeSubagents.push({
           id: f.agentId,
           label: f.label,
           agentType: f.agentType,
-          model: latest?.model || undefined,
-          ctx: latest?.ctx ?? 0,
+          model: f.last?.model || undefined,
+          ctx: f.last?.ctx ?? 0,
           lastActivity: f.lastActivity,
-          costUsd,
+          costUsd: f.totalUsd,
         });
       }
       activeSubagents.sort((a, b) => b.lastActivity - a.lastActivity);
