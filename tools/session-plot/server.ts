@@ -29,6 +29,7 @@ function sendJson(res: ServerResponse, status: number, value: unknown): void {
 }
 
 let liveJs: Promise<string> | null = null;
+let mainJs: Promise<string> | null = null;
 
 function streamLive(req: IncomingMessage, res: ServerResponse): void {
   res.writeHead(200, {
@@ -76,8 +77,14 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
     const m = /^\/api\/session\/([^/]+)$/.exec(path);
     if (m) {
+      let id: string;
       try {
-        return sendJson(res, 200, parseSession(decodeURIComponent(m[1])));
+        id = decodeURIComponent(m[1]);
+      } catch {
+        return send(res, 400, "bad session id: malformed percent-encoding\n", "text/plain; charset=utf-8");
+      }
+      try {
+        return sendJson(res, 200, parseSession(id));
       } catch (err) {
         if (err instanceof SessionNotFoundError) return sendJson(res, 404, { error: "session not found" });
         throw err;
@@ -101,8 +108,12 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     }
 
     if (path === "/main.js") {
-      const js = await bundleClient(false);
-      return send(res, 200, js, "text/javascript; charset=utf-8");
+      // Cache the bundle, but drop a failed attempt so the next request retries the build.
+      mainJs ??= bundleClient(false).catch((err: unknown) => {
+        mainJs = null;
+        throw err;
+      });
+      return send(res, 200, await mainJs, "text/javascript; charset=utf-8");
     }
 
     if (path === "/live.js") {

@@ -3,7 +3,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseSession } from "./src/parse";
+import { parseSession, SessionNotFoundError } from "./src/parse";
 import { bundleClient } from "./src/bundle";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -18,7 +18,17 @@ const outFile = process.argv[3] ? resolve(process.argv[3]) : join(here, "out", `
 const BS = String.fromCharCode(92);
 const LS = String.fromCharCode(0x2028);
 const PS = String.fromCharCode(0x2029);
-const dataJson = JSON.stringify(parseSession(id))
+let session;
+try {
+  session = parseSession(id);
+} catch (err) {
+  if (err instanceof SessionNotFoundError) {
+    console.error(`session not found: ${id}`);
+    process.exit(1);
+  }
+  throw err;
+}
+const dataJson = JSON.stringify(session)
   .split("<").join(BS + "u003c")
   .split(LS).join(BS + "u2028")
   .split(PS).join(BS + "u2029");

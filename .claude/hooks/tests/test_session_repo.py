@@ -1,5 +1,5 @@
-"""Tests for hooks/session-repo.py (this repo copy). Run with:
-python3 -I -m unittest discover -s hooks/tests -p 'test_session_repo.py' -v
+"""Tests for hooks/session-repo.py (this repo copy). Run from .claude/hooks with:
+python3 -I -m unittest discover -s tests -p 'test_session_repo.py' -v
 """
 
 import json

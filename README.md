@@ -2,7 +2,7 @@
 
 An orchestration harness for Claude Code. The main session plans a task DAG and dispatches the implementation work to cheap Haiku "executor" subagents, while hooks enforce that split. The harness lives under `.claude/` and holds only the shareable config: workflow rules, hooks, agent definitions, generator scripts and the hook registrations in `.claude/settings.harness.json`. The repo also carries a `tools/` directory with standalone tools (see Tools below).
 
-> **Note:** because the harness sits in `.claude/`, opening Claude Code inside this repo still loads `.claude/CLAUDE.md` and `.claude/agents/` as project config. These are harmless duplicates of the installed copies. Hooks come only from the installed `~/.claude/settings.json`, never from this repo: the repo file is named `.claude/settings.harness.json` so Claude Code does not read it as project settings, and it takes effect only after `./deploy.sh` merges it into `~/.claude/settings.json`.
+> **Note:** because the harness sits in `.claude/`, opening Claude Code inside this repo still loads `.claude/CLAUDE.md` and `.claude/agents/` as project config. A project-level agent in `.claude/agents/` overrides a same-named user agent, so the repo definitions can differ from the installed ones until `./deploy.sh` is run; `.claude/CLAUDE.md` is loaded as project instructions on top of the user's global CLAUDE.md. Hooks come only from the installed `~/.claude/settings.json`, never from this repo: the repo file is named `.claude/settings.harness.json` so Claude Code does not read it as project settings, and it takes effect only after `./deploy.sh` merges it into `~/.claude/settings.json`.
 
 ## How it works
 

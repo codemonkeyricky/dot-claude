@@ -1,5 +1,5 @@
 // Node-only: reads Claude Code session transcripts from ~/.claude/projects.
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { turnCost } from "./cost";
@@ -112,6 +112,39 @@ function readHeadLines(file: string, n: number): string[] {
   }
 }
 
+// Reads the last `bytes` bytes of the file as whole lines. The partial line at the cut is dropped;
+// a file smaller than `bytes` is read in full.
+const TAIL_BYTES = 64 * 1024;
+function readTailLines(file: string, bytes: number = TAIL_BYTES): string[] {
+  const fd = openSync(file, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - bytes);
+    const buf = Buffer.alloc(size - start);
+    let got = 0;
+    while (got < buf.length) {
+      const n = readSync(fd, buf, got, buf.length - got, start + got);
+      if (n === 0) break;
+      got += n;
+    }
+    let text = buf.subarray(0, got).toString("utf8");
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    return text.split("\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Picker title for a transcript: head (first HEAD_LINES lines) plus tail (last 64 KB).
+export function sessionTitleFromFile(file: string): string {
+  const head = readHeadLines(file, HEAD_LINES);
+  const tail = readTailLines(file);
+  return titleFrom(head, tail);
+}
+
 // First real user prompt text in a line, or null (command and system wrappers are skipped).
 export function userText(o: Obj): string | null {
   if (o.type !== "user" || !o.message || typeof o.message !== "object") return null;
@@ -133,15 +166,22 @@ export function userText(o: Obj): string | null {
   return t;
 }
 
-function titleFrom(lines: string[]): string {
+// Title for the session picker. head = first lines of the file, tail = last lines (may be empty).
+// A rename appends a custom-title record, so the last one in head or tail wins; summary and
+// first-prompt fallbacks come from head only.
+function titleFrom(head: string[], tail: string[] = []): string {
   const objs: Obj[] = [];
-  for (const line of lines.slice(0, HEAD_LINES)) {
+  for (const line of head.slice(0, HEAD_LINES)) {
     const o = parseLine(line);
     if (o) objs.push(o);
   }
-  // The last custom-title record wins (a rename appends a new record).
+  const tailObjs: Obj[] = [];
+  for (const line of tail) {
+    const o = parseLine(line);
+    if (o) tailObjs.push(o);
+  }
   let custom: Obj | undefined;
-  for (const o of objs) {
+  for (const o of [...objs, ...tailObjs]) {
     if (o.type === "custom-title" && typeof o.customTitle === "string" && o.customTitle.trim()) custom = o;
   }
   if (custom) return String(custom.customTitle).trim();
@@ -203,7 +243,7 @@ export function listSessions(): SessionSummary[] {
       out.push({
         id,
         projectDir: dir,
-        title: titleFrom(readHeadLines(file, HEAD_LINES)),
+        title: sessionTitleFromFile(file),
         mtime: st.mtimeMs,
         sizeBytes: st.size,
         subagentCount,

@@ -105,6 +105,12 @@ interface Locator {
   agentId: string | null;
 }
 
+// True when the error means the file or its directory is no longer there.
+function isGoneError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
 function locate(root: string, path: string): Locator | null {
   const rel = relative(root, path).split(sep);
   if (rel.length === 2 && rel[1].endsWith(".jsonl")) {
@@ -129,6 +135,8 @@ export class LiveIndex extends EventEmitter {
   readonly firstSnapshotMs: number;
   private files = new Map<string, FileState>();
   private sessions = new Map<string, SessionRec>();
+  // Paths already reported by warnOnce, so a persistent read error logs once.
+  private warned = new Set<string>();
   private pending = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
   private lastEmit = 0;
@@ -245,11 +253,12 @@ export class LiveIndex extends EventEmitter {
     this.emit("update", update);
   }
 
-  // Keeps memory bounded to the 24 h window. Only the per-message records (msgs) older than the
-  // cutoff are dropped; the all-time summary (seen, totals, peak, last message) stays while the
-  // session is live. A session is live while any of its files was written inside the window, and
-  // all of its files are kept with it. A session whose files are all older than the cutoff is
-  // dropped, and walk() does not re-add it because its files are out of window and untracked.
+  // Only msgs (the per-message records behind the per-minute buckets) is bounded to the 24 h window:
+  // entries older than the cutoff are dropped. The seen map, totals, peak and last message are
+  // all-time per live session and are not pruned while the session is live, so their memory is
+  // bounded per session, not per 24 h. A session is live while any of its files was written inside
+  // the window, and all of its files are kept with it. A session whose files are all older than the
+  // cutoff is dropped, and walk() does not re-add it because its files are out of window and untracked.
   private prune(): void {
     const cutoff = Date.now() - DAY;
     for (const st of this.files.values()) {
@@ -353,7 +362,8 @@ export class LiveIndex extends EventEmitter {
     let stat: Stats;
     try {
       stat = statSync(path);
-    } catch {
+    } catch (err) {
+      if (!isGoneError(err)) return this.warnOnce(path, err);
       const gone = this.files.get(path);
       if (!gone) return null;
       this.forget(gone);
@@ -363,12 +373,24 @@ export class LiveIndex extends EventEmitter {
     if (!st) st = this.newFile(path, loc, stat);
     try {
       return this.readNew(st, stat) ? st.sessionId : null;
-    } catch {
-      // ENOENT, ENOTDIR or a read error between stat and open: forget it. A later walk or
-      // watch event starts it over from the beginning if the file is back.
+    } catch (err) {
+      // The file is gone (ENOENT or ENOTDIR) between stat and read: forget it. A later walk or
+      // watch event starts it over from the beginning if the file is back. Any other error keeps
+      // the state and is reported once, so a transient read failure does not reset the file.
+      if (!isGoneError(err)) return this.warnOnce(path, err);
       this.forget(st);
       return st.sessionId;
     }
+  }
+
+  // Logs a read failure for a path once per process and reports no state change.
+  private warnOnce(path: string, err: unknown): null {
+    if (!this.warned.has(path)) {
+      this.warned.add(path);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`session-plot: cannot read ${path}: ${msg}`);
+    }
+    return null;
   }
 
   private newFile(path: string, loc: Locator, stat: Stats): FileState {

@@ -185,18 +185,29 @@ function drawStacked(spec: ChartSpec, s: LiveSnapshot): void {
     }
   });
 
-  // Labels every 15 minutes, plus the newest minute.
+  // Labels every 15 minutes, plus the newest minute. A 15-minute label that would sit within
+  // 36 px of the newest label is skipped, so the two never overlap at the right edge.
+  const endX = LEFT + (n - 1) * slot + slot / 2;
   s.perMinute.forEach((m, i) => {
     if (new Date(m.t).getMinutes() % 15 !== 0 && i !== n - 1) return;
     const x = LEFT + i * slot + slot / 2;
+    if (i !== n - 1 && Math.abs(x - endX) < 36) return;
     out.push(`<text class="tick" x="${x.toFixed(1)}" y="${H - 6}" text-anchor="middle">${hhmm(m.t)}</text>`);
   });
 
-  // Transparent full-height hit columns (hover or tap for the minute breakdown).
+  // Transparent full-height hit columns (hover or tap for the minute breakdown). The per-minute
+  // summary sits on the column, because the bar titles above it are covered by these rects.
   s.perMinute.forEach((m, i) => {
     const sel = m.t === selectedT ? " sel" : "";
+    const vals = perMin[i];
+    const total = Object.values(vals).reduce((a, b) => a + b, 0);
+    const lines = [`${hhmm(m.t)} total ${spec.fmtValue(total)}`];
+    for (const model of models) {
+      const v = vals[model] ?? 0;
+      if (v > 0) lines.push(`${model} ${spec.fmtValue(v)}`);
+    }
     out.push(
-      `<rect class="col${sel}" data-t="${m.t}" x="${(LEFT + i * slot).toFixed(1)}" y="${TOP}" width="${slot.toFixed(1)}" height="${plotH}"/>`,
+      `<rect class="col${sel}" data-t="${m.t}" x="${(LEFT + i * slot).toFixed(1)}" y="${TOP}" width="${slot.toFixed(1)}" height="${plotH}"><title>${esc(lines.join("\n"))}</title></rect>`,
     );
   });
   out.push("</svg>");
