@@ -33,7 +33,7 @@ for (const [k, v] of Object.entries({ window: w, document: w.document, localStor
 // Fake clock: Date and setInterval (livepage's one-second tick) advance only when told to.
 mock.timers.enable({ apis: ["Date", "setInterval"], now: T0 });
 
-function session(id: string, ago: number): LiveSession {
+function session(id: string, ago: number, costToday = 1): LiveSession {
   return {
     id,
     projectDir: `-home-example-${id}`,
@@ -43,7 +43,7 @@ function session(id: string, ago: number): LiveSession {
     mainCtx: 1000,
     mainPeakCtx: 1000,
     mainTurns: 2,
-    costToday: 1,
+    costToday,
     costLastHour: 0.5,
     tokToday: { in: 10, cacheWrite: 0, cacheRead: 0, out: 5 },
     tokLastHour: { in: 4, cacheWrite: 0, cacheRead: 0, out: 2 },
@@ -80,6 +80,33 @@ function kindButton(kind: string): HTMLButtonElement {
   return btn;
 }
 
+// A mouse click as a browser dispatches it: detail 1 for a pointer press, 0 for keyboard activation.
+function clickButton(btn: Element, detail = 1): void {
+  btn.dispatchEvent(new w.MouseEvent("click", { bubbles: true, detail }));
+}
+
+// Pointer release and cancel reach the document, as they do in a browser.
+function releaseOn(type: "pointerup" | "pointercancel", target: Element): void {
+  target.dispatchEvent(new w.MouseEvent(type, { bubbles: true }));
+}
+
+function modeOf(id: string): string | undefined {
+  return w.document.querySelector<HTMLElement>(`.card[data-id="${id}"] button[aria-pressed="true"]`)?.dataset.mode;
+}
+
+function otherMode(mode: string | undefined): string {
+  return mode === "tokens" ? "cost" : "tokens";
+}
+
+function cardText(id: string): string {
+  return w.document.querySelector<HTMLElement>(`.card[data-id="${id}"]`)?.textContent ?? "";
+}
+
+// Lets the post-release macrotask run.
+function flush(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 5));
+}
+
 function pointerPress(btn: HTMLButtonElement): void {
   btn.dispatchEvent(new w.MouseEvent("pointerdown", { bubbles: true, button: 0 }));
 }
@@ -98,7 +125,7 @@ test("every card keeps its last-activity text across toggles, kind changes and u
   for (const c of metaTexts()) assert.match(c.ago, /^last activity /, `initial ${c.id}`);
 
   // Pointer toggle on the first card, keyboard toggle on the second.
-  pointerPress(modeButton("aaa", "tokens"));
+  clickButton(modeButton("aaa", "tokens"));
   keyboardActivate(modeButton("bbb", "tokens"));
   for (const c of metaTexts()) assert.match(c.ago, /^last activity /, `after toggles ${c.id}`);
 
@@ -131,4 +158,79 @@ test("keyboard focus stays on a toggle button when its card is rebuilt", async (
   assert.equal(focused?.dataset.mode, "tokens");
   assert.equal(focused?.closest(".card")?.getAttribute("data-id"), "bbb");
   assert.equal(focused?.isConnected, true);
+});
+
+const SESSIONS = (costAaa = 1) => [session("aaa", 5_000, costAaa), session("bbb", 40_000), session("ccc", 90_000)];
+
+test("a press cancelled by the browser (touch scroll) does not toggle", async () => {
+  await loaded;
+  push(snapshot(SESSIONS()));
+  const before = modeOf("ccc");
+  const btn = modeButton("ccc", otherMode(before));
+  pointerPress(btn);
+  releaseOn("pointercancel", w.document.body);
+  await flush();
+  assert.equal(modeOf("ccc"), before);
+});
+
+test("a snapshot during a press keeps the button; the click after release toggles once and shows the newest numbers", async () => {
+  await loaded;
+  push(snapshot(SESSIONS()));
+  const before = modeOf("aaa");
+  const btn = modeButton("aaa", otherMode(before));
+  let clicks = 0;
+  btn.addEventListener("click", () => clicks++);
+  pointerPress(btn);
+  push(snapshot(SESSIONS(123.45)));
+  assert.equal(btn.isConnected, true, "the held card's button was not replaced");
+  assert.equal(modeOf("aaa"), before, "the snapshot did not toggle the card");
+  releaseOn("pointerup", btn);
+  clickButton(btn);
+  assert.equal(clicks, 1, "the click reached the same button node");
+  assert.equal(modeOf("aaa"), otherMode(before), "toggled exactly once");
+  await flush();
+  assert.match(cardText("aaa"), /\$123\.45/, "the card shows the newest snapshot after release");
+});
+
+test("keyboard Enter (click with detail 0) toggles once and keeps focus on the new button", async () => {
+  await loaded;
+  push(snapshot(SESSIONS()));
+  const before = modeOf("bbb");
+  clickButton(modeButton("bbb", otherMode(before)), 0);
+  assert.equal(modeOf("bbb"), otherMode(before));
+  assert.equal(w.document.activeElement, modeButton("bbb", otherMode(before)));
+});
+
+test("a click with no preceding pointerdown (synthetic) toggles once", async () => {
+  await loaded;
+  push(snapshot(SESSIONS()));
+  const before = modeOf("ccc");
+  clickButton(modeButton("ccc", otherMode(before)), 1);
+  assert.equal(modeOf("ccc"), otherMode(before));
+});
+
+test("a mouse press dragged off the button and released elsewhere does not toggle", async () => {
+  await loaded;
+  push(snapshot(SESSIONS()));
+  const before = modeOf("bbb");
+  const btn = modeButton("bbb", otherMode(before));
+  pointerPress(btn);
+  releaseOn("pointerup", w.document.getElementById("cards") as Element);
+  // A click on the common ancestor (the cards container), as the browser dispatches it.
+  clickButton(w.document.getElementById("cards") as Element);
+  await flush();
+  assert.equal(modeOf("bbb"), before);
+});
+
+test("the hold ends after 2 s without a release, so a held card catches up", async () => {
+  await loaded;
+  push(snapshot(SESSIONS()));
+  const btn = modeButton("aaa", otherMode(modeOf("aaa")));
+  pointerPress(btn);
+  push(snapshot(SESSIONS(77.5)));
+  assert.equal(btn.isConnected, true);
+  await new Promise((r) => setTimeout(r, 2_100));
+  await flush();
+  assert.equal(btn.isConnected, false, "the safety release re-rendered the card");
+  assert.match(cardText("aaa"), /\$77\.50/);
 });
