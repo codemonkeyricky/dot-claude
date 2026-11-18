@@ -6,14 +6,14 @@ Pools:
   reviewer  <- <root>/scripts/opus-reviewer.md       -> <root>/agents/pr-reviewer-1.md ... pr-reviewer-3.md
                (source is a frontmatter + body definition; edit it directly)
 
-<root> defaults to ~/.claude (the installed config). In this repo, use --root .
+<root> defaults to ~/.claude (the installed config). In this repo, the harness is in .claude/, so use --root .claude
 
 Run after editing either source:
 
-    python3 scripts/gen_executors.py --root .
+    python3 .claude/scripts/gen_executors.py --root .claude
 
 Usage: python3 gen_executors.py [--root DIR] [--check]
-  --root DIR  config root holding scripts/ and agents/ (default ~/.claude)
+  --root DIR  config root holding scripts/ and agents/ (default ~/.claude; this repo: .claude)
   (no flag)   write each <root>/agents/<slug>.md for every pool
   --check     write nothing; print "stale: <path>" for each missing or
               differing file (covers every pool) and exit 1 if any, else exit 0

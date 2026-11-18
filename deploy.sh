@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Install this repo's tracked Claude Code config into ${CLAUDE_DIR:-$HOME/.claude}.
+# Install this repo's tracked Claude Code config (the tracked files under .claude/ in this repo)
+# into ${CLAUDE_DIR:-$HOME/.claude}. Paths inside .claude/ map to the same relative paths in the
+# target: .claude/hooks/x.py installs to <target>/hooks/x.py. Nothing outside .claude/ is installed.
 # Copies tracked files and never deletes anything in the target directory.
 # settings.json is deep-merged, not copied: keys from the repo win, other keys
 # already in the target are kept (dicts merge recursively; lists are replaced).
@@ -14,6 +16,8 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# Everything below works relative to the harness directory in this repo.
+cd .claude
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 
 mode=install
@@ -24,10 +28,10 @@ case "${1:-}" in
   *) echo "usage: $0 [--dry-run | --diff]" >&2; exit 2 ;;
 esac
 
-# Tracked files that get deployed (repo metadata, this script and settings.json,
-# which is merged separately, are excluded).
+# Tracked files that get deployed: git ls-files run inside .claude/ lists paths relative to it.
+# settings.json is merged separately, so it is excluded (and .gitignore, if one exists there).
 list_files() {
-  git ls-files | grep -vxF -e .gitignore -e README.md -e deploy.sh -e settings.json || true
+  git ls-files | grep -vxF -e .gitignore -e settings.json || true
 }
 
 # Write the merged settings.json (target deep-merged with the repo copy) to the file given as

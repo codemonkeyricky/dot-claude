@@ -1,5 +1,5 @@
 ---
-# Source for the PR reviewer pool. Regenerate: python3 scripts/gen_executors.py --root . (from the repo root)
+# Source for the PR reviewer pool. Regenerate: python3 .claude/scripts/gen_executors.py --root .claude (from the repo root)
 name: opus-reviewer
 description: Reviews a pull request with the code-review skill on Opus before it leaves draft, ending with a machine-read REVIEW-VERDICT line. Give it the PR (owner/repo#N or URL) and the local checkout path. Read-only: never edits, pushes or marks ready.
 model: opus
