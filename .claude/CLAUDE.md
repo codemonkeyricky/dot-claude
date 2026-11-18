@@ -16,6 +16,13 @@ These rules apply to the main (top-level) session only. If you are a subagent/ex
 - Stay the orchestrator: review reports, integrate/merge worktree results, resolve conflicts, and verify each report against its acceptance checks before telling the user it's done. Don't trust a "done" without checking.
 - Do the work directly (no subagent) only when it's trivial, needs the full conversation context, or is faster than writing a brief — within what the read-only hook allows.
 
+## PR review tiers (token budget)
+- Pick the tier from the PR diff (`gh pr view <ref> --json additions,deletions,files`), ignoring lockfiles and generated files:
+  - **Skip review:** docs/comments only, renames or moves with no logic change, data/config value tweaks. Say in the report that review was skipped and why.
+  - **Haiku review:** under ~50 changed lines with no logic, geometry, hook or security change. Dispatch a `pr-reviewer-N` with `model: "haiku"`.
+  - **Opus review (default):** everything else (logic, geometry, hooks/security, or 50+ changed lines). Dispatch `pr-reviewer-N` with no model override.
+- At most 2 review rounds per PR, stated in the brief as `Review round N of 2`. Round 2 is a re-review: give the reviewer the previously reviewed SHA and the round-1 findings so it reviews only the fix diff. If round 2 still returns CHANGES, stop and ask the user before more fixes.
+
 ## Enforcement (hooks in ~/.claude/settings.json)
 - `main-readonly.py`: main can't Write/Edit/Bash except plans, memory, and job tmp dirs. Kill switch `CLAUDE_MAIN_WRITE=1`.
 - `task-gate.py`: an Agent dispatch needs an in_progress, unblocked task owned by that `subagent_type`; rejects cycles, in_progress on a blocked task, and one executor owning two in_progress tasks; after a completion it lists ready tasks. Exempt types: web-fetch, claude-code-guide, Explore, Plan. Kill switch `CLAUDE_REQUIRE_TASK=0`.
