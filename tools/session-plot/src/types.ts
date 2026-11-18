@@ -57,6 +57,14 @@ export interface LiveMinute {
   byModel: Record<string, LiveTokens>;
 }
 
+// Token counts split by kind, summed over messages (one count per message id).
+export interface TokenSplit {
+  in: number;
+  cacheWrite: number;
+  cacheRead: number;
+  out: number;
+}
+
 export interface LiveSubagent {
   id: string;
   label: string;
@@ -65,6 +73,7 @@ export interface LiveSubagent {
   ctx: number; // latest turn context
   lastActivity: number; // epoch ms
   costUsd: number; // all turns so far
+  tokens: TokenSplit; // all turns so far
 }
 
 export interface LiveSession {
@@ -78,6 +87,8 @@ export interface LiveSession {
   mainTurns: number;
   costToday: number;
   costLastHour: number;
+  tokToday: TokenSplit; // main and subagents, same boundaries as costToday
+  tokLastHour: TokenSplit; // main and subagents, same boundaries as costLastHour
   subagentCount: number;
   activeSubagents: LiveSubagent[];
 }

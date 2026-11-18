@@ -1,5 +1,5 @@
 // Browser client for /live. No external libraries; the charts are hand-built SVG.
-import { isTokenKind, minuteTokens, minuteTokenTotal, TOKEN_KIND_LABELS, type TokenKind } from "./tokens";
+import { isTokenKind, minuteTokens, minuteTokenTotal, TOKEN_KIND_LABELS, tokensOf, type TokenKind } from "./tokens";
 import type { LiveMinute, LiveSession, LiveSnapshot } from "./types";
 
 const CTX_LIMIT = 200_000;
@@ -17,6 +17,14 @@ let serverOffset = 0; // server clock minus local clock, ms
 let selectedT: number | null = null; // minute (epoch ms) shown in the readouts of both charts
 let models: string[] = [];
 let tokenKind: TokenKind = loadTokenKind();
+
+// Per-card figures mode, keyed by session id. Stored as one JSON object in localStorage.
+type CardMode = "cost" | "tokens";
+const CARD_MODE_KEY = "session-plot.cardMode";
+let cardMode: Map<string, CardMode> = loadCardModes();
+// Rendered card node and the HTML it was built from, per session id (see renderCards).
+const cardEls = new Map<string, HTMLElement>();
+const cardHtmls = new Map<string, string>();
 
 function $<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -99,6 +107,38 @@ function saveTokenKind(k: TokenKind): void {
   } catch {
     // Not persisted; the choice still applies until the page reloads.
   }
+}
+
+function isCardMode(v: unknown): v is CardMode {
+  return v === "cost" || v === "tokens";
+}
+
+function loadCardModes(): Map<string, CardMode> {
+  const map = new Map<string, CardMode>();
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(CARD_MODE_KEY) ?? "{}");
+    if (raw && typeof raw === "object") {
+      for (const [id, v] of Object.entries(raw)) if (isCardMode(v)) map.set(id, v);
+    }
+  } catch {
+    // Storage blocked or not JSON: every card starts in Cost mode.
+  }
+  return map;
+}
+
+function saveCardModes(): void {
+  try {
+    localStorage.setItem(CARD_MODE_KEY, JSON.stringify(Object.fromEntries(cardMode)));
+  } catch {
+    // Not persisted; the modes still apply until the page reloads.
+  }
+}
+
+// Compact token count for the cards: 12.3M, 950k, 412.
+function tokShort(n: number): string {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+  return String(Math.round(n));
 }
 
 function costsOf(m: LiveMinute): Record<string, number> {
@@ -286,38 +326,91 @@ function renderTokReadout(s: LiveSnapshot): void {
   el.innerHTML = `<strong>${hhmm(m.t)}</strong> · ${tokens(total)} ${esc(label)} tokens<br>${lines.join("<br>")}`;
 }
 
+function parseCard(html: string): HTMLElement {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  return tpl.content.firstElementChild as HTMLElement;
+}
+
+// Only a card whose HTML changed is replaced, so a click or keyboard focus on an unchanged card
+// survives the snapshot. Nodes are moved to match the snapshot order, and gone sessions are removed.
 function renderCards(s: LiveSnapshot): void {
   const grid = $<HTMLElement>("cards");
   if (s.sessions.length === 0) {
     grid.innerHTML = `<p class="muted">No session activity in the last 24 h.</p>`;
+    cardEls.clear();
+    cardHtmls.clear();
     return;
   }
-  grid.innerHTML = s.sessions.map(cardHtml).join("");
+  const wanted = new Set(s.sessions.map((x) => x.id));
+  for (const [id, el] of cardEls) {
+    if (wanted.has(id)) continue;
+    el.remove();
+    cardEls.delete(id);
+    cardHtmls.delete(id);
+  }
+  s.sessions.forEach((x, idx) => {
+    const html = cardHtml(x);
+    let el = cardEls.get(x.id);
+    if (!el) {
+      el = parseCard(html);
+      cardEls.set(x.id, el);
+    } else if (cardHtmls.get(x.id) !== html) {
+      const fresh = parseCard(html);
+      el.replaceWith(fresh);
+      el = fresh;
+      cardEls.set(x.id, el);
+    }
+    cardHtmls.set(x.id, html);
+    const at = grid.children[idx];
+    if (at !== el) grid.insertBefore(el, at ?? null);
+  });
+  // Anything else in the grid (the empty-state message) goes after the cards.
+  const current = new Set<Element>(cardEls.values());
+  for (const child of [...grid.children]) if (!current.has(child)) child.remove();
 }
 
 function cardHtml(x: LiveSession): string {
   const hasMain = x.mainTurns > 0;
   const pct = Math.min(100, (x.mainCtx / CTX_LIMIT) * 100);
   const level = x.mainCtx > 185_000 ? " red" : x.mainCtx > 150_000 ? " amber" : "";
+  const tokMode = cardMode.get(x.id) === "tokens";
   const subs = x.activeSubagents
-    .map(
-      (a) =>
+    .map((a) => {
+      const fig = tokMode ? ` <span class="mono">${tokShort(tokensOf(a.tokens, tokenKind))} tok</span>` : "";
+      return (
         `<li><span class="sub-label">${esc(shorten(a.label, 70))}</span> ` +
-        `<span class="muted">${esc(a.model ?? "—")}</span> <span class="mono">${kTok(a.ctx)}</span></li>`,
-    )
+        `<span class="muted">${esc(a.model ?? "—")}</span> <span class="mono">${kTok(a.ctx)}</span>${fig}</li>`
+      );
+    })
     .join("");
+  const figures = tokMode
+    ? `<div class="muted small card-kind">tokens: ${esc(TOKEN_KIND_LABELS[tokenKind].toLowerCase())}</div>` +
+      `<div class="money"><span>today <b>${tokShort(tokensOf(x.tokToday, tokenKind))} tok</b></span>` +
+      `<span>last hour <b>${tokShort(tokensOf(x.tokLastHour, tokenKind))} tok</b></span>` +
+      `<span class="muted">${x.mainTurns} turns · ${x.subagentCount} subagents</span></div>`
+    : `<div class="money"><span>today <b>${usd(x.costToday)}</b></span>` +
+      `<span>last hour <b>${usd(x.costLastHour)}</b></span>` +
+      `<span class="muted">${x.mainTurns} turns · ${x.subagentCount} subagents</span></div>`;
+  // The toggle sits above the card's stretched title link, so a press on it never navigates.
+  const toggle =
+    `<div class="mode-toggle" role="group" aria-label="Card figures">` +
+    `<button type="button" class="mode-btn" data-mode="cost" aria-pressed="${String(!tokMode)}">Cost</button>` +
+    `<button type="button" class="mode-btn" data-mode="tokens" aria-pressed="${String(tokMode)}">Tokens</button>` +
+    `</div>`;
   return (
-    `<a class="card" href="/?session=${encodeURIComponent(x.id)}&amp;live=1" data-last="${x.lastActivity}">` +
-    `<div class="card-head"><span class="dot" aria-hidden="true"></span><span class="ctitle">${esc(shorten(x.title, 120))}</span></div>` +
+    `<div class="card" data-id="${esc(x.id)}" data-last="${x.lastActivity}">` +
+    `<div class="card-head"><span class="dot" aria-hidden="true"></span>` +
+    `<a class="card-link" href="/?session=${encodeURIComponent(x.id)}&amp;live=1"><span class="ctitle">${esc(shorten(x.title, 120))}</span></a>` +
+    toggle +
+    `</div>` +
     `<div class="muted small">${esc(x.projectDir)} · <span class="ago"></span></div>` +
     `<div class="ctxrow"><span>${esc(x.mainModel ?? "main")}</span>` +
     `<span class="mono">${hasMain ? `${kTok(x.mainCtx)} / 200k` : "—"}</span></div>` +
     `<div class="gauge${level}"><i style="width:${pct.toFixed(1)}%"></i></div>` +
-    `<div class="money"><span>today <b>${usd(x.costToday)}</b></span>` +
-    `<span>last hour <b>${usd(x.costLastHour)}</b></span>` +
-    `<span class="muted">${x.mainTurns} turns · ${x.subagentCount} subagents</span></div>` +
+    figures +
     (subs ? `<div class="muted small">active subagents</div><ul class="subs">${subs}</ul>` : "") +
-    `</a>`
+    `</div>`
   );
 }
 
@@ -399,7 +492,10 @@ $<HTMLElement>("tokKind").addEventListener("click", (e) => {
   tokenKind = k;
   saveTokenKind(k);
   updateKindButtons();
-  if (snap) renderTokens(snap);
+  if (snap) {
+    renderTokens(snap);
+    renderCards(snap); // token-mode cards show the newly selected kind
+  }
 });
 updateKindButtons();
 
@@ -417,6 +513,39 @@ if (typeof ResizeObserver !== "undefined") {
 } else {
   window.addEventListener("resize", redraw);
 }
+
+function setCardMode(id: string, mode: CardMode, keyboard: boolean): void {
+  if (cardMode.get(id) === mode) return;
+  cardMode.set(id, mode);
+  saveCardModes();
+  if (snap) renderCards(snap);
+  tick();
+  // A keyboard press replaces the button it came from, so put focus back on the new one.
+  if (keyboard) cardEls.get(id)?.querySelector<HTMLButtonElement>(`button[data-mode="${mode}"]`)?.focus();
+}
+
+// One delegated listener on the cards container handles every card's toggle.
+function modeButtonOf(e: Event): { id: string; mode: CardMode } | null {
+  const btn = (e.target as Element | null)?.closest?.("button[data-mode]") as HTMLButtonElement | null;
+  const id = btn?.closest?.(".card")?.getAttribute("data-id");
+  const mode = btn?.dataset.mode;
+  if (!btn || !id || !isCardMode(mode)) return null;
+  return { id, mode };
+}
+
+const cardsEl = $<HTMLElement>("cards");
+// Mouse, touch and pen act on pointerdown, before any re-render can swallow the mouseup.
+cardsEl.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  const hit = modeButtonOf(e);
+  if (hit) setCardMode(hit.id, hit.mode, false);
+});
+// Keyboard activation fires click with detail 0. Pointer clicks (detail >= 1) were handled above.
+cardsEl.addEventListener("click", (e) => {
+  if (e.detail !== 0) return;
+  const hit = modeButtonOf(e);
+  if (hit) setCardMode(hit.id, hit.mode, true);
+});
 
 setInterval(tick, 1000);
 connect();

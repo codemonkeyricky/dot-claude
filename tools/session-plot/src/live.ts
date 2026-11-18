@@ -25,7 +25,7 @@ import {
   titleOf,
   userText,
 } from "./parse";
-import type { LiveMinute, LiveSession, LiveSnapshot, LiveSubagent, LiveTokens } from "./types";
+import type { LiveMinute, LiveSession, LiveSnapshot, LiveSubagent, LiveTokens, TokenSplit } from "./types";
 
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
@@ -54,6 +54,18 @@ interface Seen {
   model: string;
   usd: number;
   ctx: number;
+  tok: TokenSplit;
+}
+
+function zeroTok(): TokenSplit {
+  return { in: 0, cacheWrite: 0, cacheRead: 0, out: 0 };
+}
+
+function addTok(acc: TokenSplit, m: Msg): void {
+  acc.in += m.in;
+  acc.cacheWrite += m.cw;
+  acc.cacheRead += m.cr;
+  acc.out += m.out;
 }
 
 interface Last {
@@ -75,6 +87,7 @@ interface FileState {
   msgs: Map<string, Msg>; // windowed per-message records (pruned to the 24 h window)
   seen: Map<string, Seen>; // all-time per-message records (dedupe, turns, cost)
   totalUsd: number; // all-time cost of this file
+  totalTok: TokenSplit; // all-time tokens of this file, same dedupe as totalUsd
   peakCtx: number; // all-time peak context
   last: Last | null; // newest non-synthetic assistant message
   lastActivity: number; // epoch ms, newest timestamp seen
@@ -407,6 +420,7 @@ export class LiveIndex extends EventEmitter {
       msgs: new Map(),
       seen: new Map(),
       totalUsd: 0,
+      totalTok: zeroTok(),
       peakCtx: 0,
       last: null,
       lastActivity: 0,
@@ -441,6 +455,7 @@ export class LiveIndex extends EventEmitter {
       st.msgs.clear();
       st.seen.clear();
       st.totalUsd = 0;
+      st.totalTok = zeroTok();
       st.peakCtx = 0;
       st.last = null;
       st.lastActivity = 0;
@@ -533,8 +548,14 @@ export class LiveIndex extends EventEmitter {
     const usd = turnCost(model, usage).usd;
 
     // All-time summary: replaces this id's previous usage, so repeated lines count once.
-    st.seen.set(key, { t, model, usd, ctx });
+    const tok: TokenSplit = { in: input, cacheWrite: cw, cacheRead: cr, out };
+    const prevTok = prev?.tok ?? zeroTok();
+    st.seen.set(key, { t, model, usd, ctx, tok });
     st.totalUsd += usd - (prev?.usd ?? 0);
+    st.totalTok.in += tok.in - prevTok.in;
+    st.totalTok.cacheWrite += tok.cacheWrite - prevTok.cacheWrite;
+    st.totalTok.cacheRead += tok.cacheRead - prevTok.cacheRead;
+    st.totalTok.out += tok.out - prevTok.out;
     if (ctx > st.peakCtx) st.peakCtx = ctx;
     // Synthetic placeholders (model "<...>") never become the session's latest message.
     if (!model.startsWith("<") && (st.last === null || t >= st.last.t)) st.last = { t, model, ctx };
@@ -576,17 +597,21 @@ export class LiveIndex extends EventEmitter {
 
       let costToday = 0;
       let costLastHour = 0;
+      const tokToday = zeroTok();
+      const tokLastHour = zeroTok();
       for (const f of files) {
         for (const m of f.msgs.values()) {
           if (m.model.startsWith("<")) continue; // synthetic placeholders
           if (m.t >= midnight) {
             costToday += m.usd;
             totals.costToday += m.usd;
+            addTok(tokToday, m);
           }
           if (m.t >= hourAgo) {
             costLastHour += m.usd;
             totals.costLastHour += m.usd;
             totals.outLastHour += m.out;
+            addTok(tokLastHour, m);
           }
           const idx = Math.floor((m.t - winStart) / MINUTE);
           if (idx >= 0 && idx < WINDOW_MIN) {
@@ -626,6 +651,7 @@ export class LiveIndex extends EventEmitter {
           ctx: f.last?.ctx ?? 0,
           lastActivity: f.lastActivity,
           costUsd: f.totalUsd,
+          tokens: { ...f.totalTok },
         });
       }
       activeSubagents.sort((a, b) => b.lastActivity - a.lastActivity);
@@ -642,6 +668,8 @@ export class LiveIndex extends EventEmitter {
         mainTurns,
         costToday,
         costLastHour,
+        tokToday,
+        tokLastHour,
         subagentCount: sess.subs.size,
         activeSubagents,
       });

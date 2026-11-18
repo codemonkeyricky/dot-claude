@@ -98,13 +98,31 @@
   .rrow { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 10px; }
+  /* The card is a div. Its title link stretches over the whole card (::after), and the toggle
+     sits above that overlay, so a press on the toggle never reaches the link. */
   .card {
-    display: block; min-width: 0; color: inherit; text-decoration: none;
+    position: relative; display: block; min-width: 0; color: inherit;
     background: var(--panel); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px;
   }
-  .card:hover, .card:focus-visible { border-color: var(--muted); }
-  .card-head { display: flex; align-items: flex-start; gap: 8px; }
+  .card:hover { border-color: var(--muted); }
+  .card-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 4px 8px; }
+  .card-link { flex: 1 1 160px; min-width: 0; color: inherit; text-decoration: none; border-radius: 4px; }
+  .card-link::after { content: ""; position: absolute; inset: 0; border-radius: 8px; }
+  .card-link:focus-visible { outline: 2px solid var(--m1); outline-offset: 2px; }
+  .card:hover .ctitle, .card-link:focus-visible .ctitle { text-decoration: underline; }
   .ctitle { font-weight: 600; word-break: break-word; min-width: 0; }
+  .card-kind { margin-top: 4px; }
+  .mode-toggle {
+    position: relative; z-index: 1; flex: 0 0 auto; margin-left: auto; max-width: 100%;
+    display: inline-flex; border: 1px solid var(--grid); border-radius: 8px; overflow: hidden;
+  }
+  .mode-btn {
+    min-height: 32px; min-width: 44px; padding: 4px 10px; border: 0;
+    background: var(--panel); color: var(--fg); font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .mode-btn + .mode-btn { border-left: 1px solid var(--grid); }
+  .mode-btn[aria-pressed="true"] { background: var(--grid); font-weight: 600; }
+  .mode-btn:focus-visible { outline: 2px solid var(--m1); outline-offset: -2px; }
   .card .dot {
     position: relative; flex: 0 0 auto; width: 9px; height: 9px; margin-top: 6px;
     border-radius: 50%; background: var(--grid);
