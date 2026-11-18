@@ -82,6 +82,8 @@ Host config is in `.claude/hooks/deploy-hooks.local.json`, which is gitignored. 
 - `remote` (default): vite builds the snapshot locally to learn the expected bundle name, then `vercel deploy` builds it remotely.
 - `prebuilt`: the repo's `build.command` runs in a snapshot, then `vercel deploy --prebuilt`.
 
+`build.env` is applied to the local build. For `remote` it is also passed to the remote build as `--build-env K=V`; `VERCEL_GIT_COMMIT_SHA` is always the deployed sha, and a `build.env` value for it is ignored with a warning.
+
 Each repo entry can also set:
 
 - `branch`: the prod branch to deploy (`origin/<branch>`). When it is absent, the reconciler reads the checkout's default branch from `refs/remotes/origin/HEAD` and falls back to `master` if that ref is missing.
@@ -92,7 +94,15 @@ The top-level `deploys_log_path` sets where those log rows go (`~` is expanded).
 
 A pass does nothing until the state file exists, so run `python3 -I .claude/hooks/deploy-reconcile.py --seed` once per repo.
 
-A failed snapshot is kept under `~/.cache/deploy-hooks` for debugging. Each pass deletes the older failed snapshots of that repo and keeps the newest one. If a `~/.vercel` or `~/.env.local` appears during a pass, the pass fails. Paths that already exist when the pass starts only get a warning in the log.
+A failed snapshot is kept under `~/.cache/deploy-hooks` for debugging. Each pass deletes the older failed snapshots of that repo and keeps the newest one. A snapshot dir is named `<repo>-prod-` or `<repo>-pr-` plus 8 random characters, and only that exact shape is pruned, so a repo named `app` never prunes the snapshots of `app-pr` or `app-prod`.
+
+If a `~/.vercel` or `~/.env.local` appears during a pass, only the deploy that sees it fails: it is not recorded as verified, and the pass goes on with its remaining actions. A guard path that stays present also fails the later deploys that check it, until it is removed. Paths that already exist when the pass starts are not fatal; every pass logs a warning for each of them.
+
+Prod deploys go live before verification; a failed verification is recorded so a revert redeploys. The state keeps the failed sha as the prod sha with `"verified": false`, so reverting master to the previous sha differs from it and plans a prod redeploy. The failed sha itself is not retried, so a broken build does not loop; `--retry-failed` retries it on demand.
+
+A preview cleanup drops its state entry only when `vercel alias rm` succeeds or reports that the alias itself is not found or does not exist. An auth, scope or network error keeps the entry and logs an error, and the cleanup is retried on the next pass.
+
+Builds run with the reconciler's full environment (`build.env` adds to it and does not replace it), so a PR's build scripts can read your environment, tokens included. Only install hooks for repos whose PR branches you trust. Every command runs in its own process group, and a timed-out command is killed together with its whole group.
 
 State, per-repo logs and events are kept in `~/.local/state/deploy-hooks`. `deploy.sh` installs the hook files and registrations; the local config is never installed.
 

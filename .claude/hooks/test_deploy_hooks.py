@@ -3,12 +3,14 @@
 Run from the repo's .claude/hooks directory: python3 -m unittest test_deploy_hooks -v
 """
 
+import atexit
 import fcntl
 import importlib.util
 import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,14 @@ def _load(modname, filename):
 trigger = _load("deploy_trigger", "deploy-trigger.py")
 reconcile = _load("deploy_reconcile", "deploy-reconcile.py")
 
+# Every test runs with state, cache and deploy logs under a temp root, never the real ~/.local/state.
+_TEST_ROOT = tempfile.mkdtemp(prefix="deploy-hooks-tests-")
+reconcile.STATE_DIR = os.path.join(_TEST_ROOT, "state")
+reconcile.CACHE_DIR = os.path.join(_TEST_ROOT, "cache")
+reconcile.EVENTS_LOG = os.path.join(reconcile.STATE_DIR, "events.jsonl")
+reconcile.DEPLOYS_LOG = os.path.join(reconcile.STATE_DIR, "deploys.jsonl")
+atexit.register(shutil.rmtree, _TEST_ROOT, True)
+
 
 class TriggerMatchTests(unittest.TestCase):
     POSITIVE = [
@@ -46,6 +56,12 @@ class TriggerMatchTests(unittest.TestCase):
         "gh pr create --fill",
         "gh -R example-org/app pr close 7",
         "gh pr ready 9",
+        "env git push",
+        "env FOO=1 git push origin feat",
+        "env -i git push",
+        "env -u HOME git push origin b",
+        "{ git push; }",
+        "{ git push origin b; }",
     ]
     NEGATIVE = [
         "git log --grep push",
@@ -56,6 +72,9 @@ class TriggerMatchTests(unittest.TestCase):
         "git commit -m 'push later'",
         "gh pr list --state open",
         "git -C /x log --oneline push",
+        "{ echo git push; }",
+        "env git log --grep push",
+        "env FOO=1 ls",
         "",
     ]
 
@@ -540,7 +559,7 @@ class GatherPrListTests(unittest.TestCase):
             return prs_json
 
         with unittest.mock.patch.object(reconcile, "git", fake_git), \
-                unittest.mock.patch.object(reconcile, "sh", fake_sh):
+                unittest.mock.patch.object(reconcile, "sh_stdout", fake_sh):
             return reconcile.gather(self.entry), calls
 
     def test_gather_fetches_configured_branch(self):
@@ -761,7 +780,10 @@ class RemoteBuildEnvTests(unittest.TestCase):
                 fh.write("x")
             return ""
 
+        vercel_args = []
+
         def fake_vercel(name, args, cwd, timeout):
+            vercel_args.append(args)
             return '{"deployment": {"url": "t-abc.vercel.app"}}'
 
         res = {"expected": None, "url": None}
@@ -772,6 +794,9 @@ class RemoteBuildEnvTests(unittest.TestCase):
         self.assertEqual(seen["env"]["VERCEL_GIT_COMMIT_SHA"], sha)
         self.assertEqual(res["expected"], "index-abc123.js")
         self.assertEqual(res["url"], "https://t-abc.vercel.app")
+        deploy = [a for a in vercel_args if a[0] == "deploy"][0]
+        pairs = [deploy[i + 1] for i, a in enumerate(deploy) if a == "--build-env"]
+        self.assertEqual(pairs, ["KV_PUBLIC_BASE=https://kv.example", f"VERCEL_GIT_COMMIT_SHA={sha}"])
 
 
 class TriggerSafetyTests(unittest.TestCase):
@@ -823,6 +848,391 @@ class TriggerSafetyTests(unittest.TestCase):
                 unittest.mock.patch.object(trigger, "spawn", side_effect=OSError("boom")), \
                 unittest.mock.patch("sys.stdin", io.StringIO(self.SESSION)):
             self.assertEqual(trigger.main(), 0)
+
+
+class FakePopen:
+    """Stands in for subprocess.Popen: no process starts. timeout=True makes the first communicate time out."""
+
+    def __init__(self, stdout="", stderr="", timeout=False):
+        self.pid = 4242
+        self.returncode = 0
+        self._out, self._err = stdout, stderr
+        self._timeout = timeout
+        self.calls = 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self._timeout and self.calls == 1:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+        return self._out, self._err
+
+
+def _popen_factory(proc, seen):
+    def fake_popen(args, **kwargs):
+        seen.append((args, kwargs))
+        return proc
+    return fake_popen
+
+
+class RunProcessTests(unittest.TestCase):
+    def test_run_returns_combined_output_in_a_new_session(self):
+        seen = []
+        proc = FakePopen(stdout="ok\n", stderr="warn\n")
+        with unittest.mock.patch.object(reconcile.subprocess, "Popen", _popen_factory(proc, seen)):
+            rc, out = reconcile.run(["git", "status"], "/x", 5)
+        self.assertEqual((rc, out), (0, "ok\nwarn\n"))
+        self.assertIs(seen[0][1]["start_new_session"], True)
+
+    def test_timeout_kills_the_whole_process_group_before_raising(self):
+        seen, killed = [], []
+        proc = FakePopen(stdout="partial", timeout=True)
+        with unittest.mock.patch.object(reconcile.subprocess, "Popen", _popen_factory(proc, seen)), \
+                unittest.mock.patch.object(reconcile.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+            rc, out = reconcile.run(["vercel", "deploy"], "/x", 5)
+        self.assertEqual(killed, [(proc.pid, signal.SIGKILL)])
+        self.assertEqual(rc, -1)
+        self.assertIn("timed out after 5s", out)
+        self.assertIn("partial", out)
+        self.assertIs(seen[0][1]["start_new_session"], True)
+
+    def test_failed_killpg_still_reports_the_timeout(self):
+        def gone(pid, sig):
+            raise ProcessLookupError(pid)
+        proc = FakePopen(timeout=True)
+        with unittest.mock.patch.object(reconcile.subprocess, "Popen", _popen_factory(proc, [])), \
+                unittest.mock.patch.object(reconcile.os, "killpg", gone):
+            rc, _out = reconcile.run(["vercel", "deploy"], "/x", 5)
+        self.assertEqual(rc, -1)
+
+
+class GhStderrTests(unittest.TestCase):
+    """gh pr list is parsed as JSON: its stderr is logged and never mixed into the parsed stdout."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ghstderr-")
+        self._saved_state = reconcile.STATE_DIR
+        reconcile.STATE_DIR = os.path.join(self.dir, "state")
+        self.entry = {"name": "t", "gh": "example-org/app", "checkout": "/home/user/app", "branch": "main"}
+
+    def tearDown(self):
+        reconcile.STATE_DIR = self._saved_state
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_gh_stderr_is_logged_not_parsed(self):
+        stdout = json.dumps([{"number": 3, "headRefOid": "b" * 40, "isCrossRepository": False}])
+        proc = FakePopen(stdout=stdout, stderr="gh: a deprecation notice {not json\n")
+
+        def fake_git(entry, args, timeout=None):
+            return ("a" * 40 + "\n") if args[0] == "rev-parse" else ""
+
+        with unittest.mock.patch.object(reconcile, "git", fake_git), \
+                unittest.mock.patch.object(reconcile.subprocess, "Popen", _popen_factory(proc, [])):
+            _master, open_prs, _truncated = reconcile.gather(self.entry)
+        self.assertEqual([p["number"] for p in open_prs], [3])
+        with open(os.path.join(reconcile.STATE_DIR, "t.log"), encoding="utf-8") as fh:
+            self.assertIn("deprecation notice", fh.read())
+
+
+class AliasCleanupTests(unittest.TestCase):
+    ENTRY = {"name": "app", "scope": "my-team", "preview": {"alias": "app-pr-{n}.vercel.app"}}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="alias-")
+        self._saved = {n: getattr(reconcile, n) for n in ("STATE_DIR", "CACHE_DIR", "EVENTS_LOG")}
+        reconcile.STATE_DIR = os.path.join(self.dir, "state")
+        reconcile.CACHE_DIR = os.path.join(self.dir, "cache")
+        reconcile.EVENTS_LOG = os.path.join(reconcile.STATE_DIR, "events.jsonl")
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(reconcile, n, v)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _cleanup(self, rc, out):
+        st = {"prod": {}, "previews": {"7": {"sha": "c" * 40, "url": "https://app-pr-7.vercel.app"}}}
+        with unittest.mock.patch.object(reconcile, "run", lambda args, cwd, timeout, env=None: (rc, out)):
+            reconcile.cleanup_preview(self.ENTRY, 7, st)
+        return st
+
+    def test_alias_not_found_drops_the_entry(self):
+        self.assertNotIn("7", self._cleanup(1, "Error: Alias app-pr-7.vercel.app not found")["previews"])
+
+    def test_alias_does_not_exist_drops_the_entry(self):
+        st = self._cleanup(1, 'Error: The specified alias "app-pr-7.vercel.app" does not exist')
+        self.assertNotIn("7", st["previews"])
+
+    def test_success_drops_the_entry(self):
+        self.assertNotIn("7", self._cleanup(0, "")["previews"])
+
+    def test_auth_error_keeps_the_entry_and_logs_an_error(self):
+        st = self._cleanup(1, "Error: Not authorized for scope my-team")
+        self.assertIn("7", st["previews"])
+        with open(os.path.join(reconcile.STATE_DIR, "app.log"), encoding="utf-8") as fh:
+            self.assertIn("ERROR cleanup of PR #7", fh.read())
+
+    def test_scope_missing_keeps_the_entry(self):
+        self.assertIn("7", self._cleanup(1, "Error: The specified scope does not exist")["previews"])
+
+    def test_network_error_keeps_the_entry(self):
+        self.assertIn("7", self._cleanup(1, "Error: request failed: ECONNRESET")["previews"])
+
+    def test_alias_helper_accepts_only_genuine_alias_gone_lines(self):
+        cases = [
+            ("Error: Alias app-pr-7.vercel.app not found", True),
+            ('Error: The specified alias "x" does not exist', True),
+            ("Error: No such alias x", True),
+            ("Error: The specified scope does not exist", False),
+            ("Error: Not authorized (scope my-team)", False),
+            ("Error: alias x not found: network timed out", False),
+            ("", False),
+        ]
+        for line, gone in cases:
+            with self.subTest(line=line):
+                self.assertEqual(reconcile.alias_already_gone(line), gone)
+
+
+class ProdVerificationTests(unittest.TestCase):
+    OLD, MASTER = "b" * 40, "a" * 40
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="prodverify-")
+        self._saved = {n: getattr(reconcile, n) for n in ("STATE_DIR", "EVENTS_LOG", "DEPLOYS_LOG")}
+        reconcile.STATE_DIR = os.path.join(self.dir, "state")
+        reconcile.EVENTS_LOG = os.path.join(self.dir, "events.jsonl")
+        reconcile.DEPLOYS_LOG = os.path.join(self.dir, "deploys.jsonl")
+        self.entry = {"name": "app", "checkout": "/home/user/app", "scope": "my-team",
+                      "prod": {"project": "app", "url": "https://app.example"}}
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(reconcile, n, v)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _deploy(self, st, sha, verified):
+        result = {"verified": verified, "error": None if verified else "serves 'index-b.js', expected 'index-a.js'",
+                  "url": "https://x.vercel.app", "expected": "index-a.js", "live": "index-b.js"}
+        with unittest.mock.patch.object(reconcile, "deploy_version", lambda *a, **k: dict(result)):
+            reconcile.deploy_prod(self.entry, sha, st)
+        return st
+
+    def test_failed_verification_then_revert_plans_prod_redeploy(self):
+        st = {"prod": {"sha": self.OLD, "failed_sha": None}, "previews": {}}
+        self._deploy(st, self.MASTER, verified=False)
+        self.assertEqual(reconcile.plan(st, self.MASTER, []), [])  # the failed sha is not retried in a loop
+        self.assertEqual(reconcile.plan(st, self.OLD, []), [{"kind": "prod", "sha": self.OLD}])
+
+    def test_failed_verification_records_the_live_sha_as_unverified(self):
+        st = self._deploy({"prod": {"sha": self.OLD}, "previews": {}}, self.MASTER, verified=False)
+        self.assertEqual(st["prod"]["sha"], self.MASTER)
+        self.assertIs(st["prod"]["verified"], False)
+        self.assertEqual(st["prod"]["failed_sha"], self.MASTER)
+
+    def test_successful_verification_is_recorded_as_verified(self):
+        st = self._deploy({"prod": {"sha": self.OLD}, "previews": {}}, self.MASTER, verified=True)
+        self.assertEqual(st["prod"]["sha"], self.MASTER)
+        self.assertIs(st["prod"]["verified"], True)
+        self.assertIsNone(st["prod"]["failed_sha"])
+
+    def test_retry_failed_replans_the_failed_prod_sha(self):
+        st = self._deploy({"prod": {"sha": self.OLD}, "previews": {}}, self.MASTER, verified=False)
+        self.assertEqual(reconcile.plan(st, self.MASTER, [], retry_failed=True),
+                         [{"kind": "prod", "sha": self.MASTER}])
+
+
+class RemoteDeployArgsTests(unittest.TestCase):
+    def test_build_env_entries_are_passed_as_build_env_flags(self):
+        sha = "f" * 40
+        args = reconcile.remote_deploy_args("S", sha, True, {"KV_PUBLIC_BASE": "https://kv.example", "FLAG": "1"})
+        self.assertEqual(args, ["deploy", "--prod", "--yes", "--scope", "S",
+                                "--build-env", "FLAG=1",
+                                "--build-env", "KV_PUBLIC_BASE=https://kv.example",
+                                "--build-env", f"VERCEL_GIT_COMMIT_SHA={sha}"])
+
+    def test_build_env_cannot_override_the_pinned_sha(self):
+        sha = "f" * 40
+        args = reconcile.remote_deploy_args("S", sha, False, {"VERCEL_GIT_COMMIT_SHA": "0" * 40})
+        pairs = [args[i + 1] for i, a in enumerate(args) if a == "--build-env"]
+        self.assertEqual(pairs, [f"VERCEL_GIT_COMMIT_SHA={sha}"])
+
+    def test_logged_args_hide_build_env_values_except_the_sha(self):
+        sha = "a" * 40
+        args = ["vercel", "deploy", "--build-env", "KV_TOKEN=s3cret", "--build-env", f"VERCEL_GIT_COMMIT_SHA={sha}"]
+        shown = reconcile.redact(args)
+        self.assertEqual(shown, ["vercel", "deploy", "--build-env", "KV_TOKEN=<redacted>",
+                                 "--build-env", f"VERCEL_GIT_COMMIT_SHA={sha}"])
+        self.assertNotIn("s3cret", " ".join(shown))
+
+
+class PrefixRepoPruneTests(unittest.TestCase):
+    """Repos app, app-pr and app-prod share a name prefix; each prune touches only its own snapshots."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="prefixprune-")
+        self.cache = os.path.join(self.dir, "cache")
+        os.makedirs(self.cache)
+        self._saved_cache = reconcile.CACHE_DIR
+        reconcile.CACHE_DIR = self.cache
+
+    def tearDown(self):
+        reconcile.CACHE_DIR = self._saved_cache
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _snap(self, name, prod, mtime):
+        path = tempfile.mkdtemp(prefix=reconcile.snapshot_prefix(name, prod), dir=self.cache)
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_repos_with_a_shared_name_prefix_do_not_prune_each_other(self):
+        app_old, app_new = self._snap("app", False, 1000), self._snap("app", True, 3000)
+        pr_old, pr_new = self._snap("app-pr", False, 1100), self._snap("app-pr", True, 3100)
+        prod_old, prod_new = self._snap("app-prod", False, 1200), self._snap("app-prod", True, 3200)
+        self.assertEqual([os.path.basename(p) for p in reconcile.prune_failed_snapshots("app")],
+                         [os.path.basename(app_old)])
+        self.assertTrue(os.path.isdir(pr_old))
+        self.assertTrue(os.path.isdir(prod_old))
+        self.assertEqual([os.path.basename(p) for p in reconcile.prune_failed_snapshots("app-pr")],
+                         [os.path.basename(pr_old)])
+        self.assertEqual([os.path.basename(p) for p in reconcile.prune_failed_snapshots("app-prod")],
+                         [os.path.basename(prod_old)])
+        for kept in (app_new, pr_new, prod_new):
+            self.assertTrue(os.path.isdir(kept))
+        self.assertFalse(os.path.exists(app_old))
+        self.assertFalse(os.path.exists(pr_old))
+        self.assertFalse(os.path.exists(prod_old))
+
+    def test_snapshot_regex_matches_only_the_real_name_shape(self):
+        pat = reconcile.snapshot_re("app")
+        self.assertIsNotNone(pat.match("app-pr-ifb8qwmg"))
+        self.assertIsNotNone(pat.match("app-prod-a_b9c0d1"))
+        self.assertIsNone(pat.match("app-pr-pr-ifb8qwmg"))
+        self.assertIsNone(pat.match("app-prod-prod-ifb8qwmg"))
+        self.assertIsNone(pat.match("app-pr-ifb8qwm"))
+        self.assertIsNone(pat.match("app-cleanup-ifb8qwmg"))
+
+
+class SeedRerunTests(unittest.TestCase):
+    REPO = {"name": "t", "gh": "example-org/app", "checkout": "/home/user/app", "scope": "my-team",
+            "branch": "main", "prod": {"project": "app", "url": "https://app.example"},
+            "preview": {"project": "app", "alias": "app-pr-{n}.vercel.app"}}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="seedrerun-")
+        self.state = os.path.join(self.dir, "state")
+        self.cfg = os.path.join(self.dir, "deploy-hooks.local.json")
+        with open(self.cfg, "w", encoding="utf-8") as fh:
+            json.dump({"repos": [self.REPO]}, fh)
+        names = ("STATE_DIR", "CONFIG_PATH", "DEPLOYS_LOG", "EVENTS_LOG")
+        self._saved = {n: getattr(reconcile, n) for n in names}
+        reconcile.STATE_DIR = self.state
+        reconcile.CONFIG_PATH = self.cfg
+        reconcile.EVENTS_LOG = os.path.join(self.state, "events.jsonl")
+        reconcile.DEPLOYS_LOG = os.path.join(self.state, "deploys.jsonl")
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(reconcile, n, v)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _seed(self, trigger_during_seed):
+        passes = []
+
+        def fake_gather(entry):
+            if trigger_during_seed:
+                # A trigger fired while the seed holds the lock: it touches the marker and is refused.
+                reconcile.touch(reconcile.rerun_marker("t"))
+            return ("a" * 40, [], False)
+
+        with unittest.mock.patch.object(reconcile, "gather", fake_gather), \
+                unittest.mock.patch.object(reconcile, "run_pass",
+                                           lambda entry, force, retry=False: passes.append(entry["name"])), \
+                unittest.mock.patch.object(reconcile.time, "sleep", lambda s: None), \
+                unittest.mock.patch("sys.stderr", io.StringIO()):
+            rc = reconcile.main(["--seed"])
+        return rc, passes, os.path.exists(reconcile.rerun_marker("t"))
+
+    def test_marker_queued_during_seed_runs_a_pass_after_release(self):
+        rc, passes, marker_left = self._seed(trigger_during_seed=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(passes, ["t"])
+        self.assertFalse(marker_left)
+
+    def test_seed_without_a_queued_trigger_runs_no_pass(self):
+        rc, passes, _marker_left = self._seed(trigger_during_seed=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(passes, [])
+        self.assertTrue(os.path.exists(reconcile.state_file("t")))
+
+
+class GuardPerPassTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="guardpass-")
+        self.pre = os.path.join(self.dir, "preexisting")
+        open(self.pre, "w").close()
+        self._saved = {n: getattr(reconcile, n) for n in ("GUARD_PATHS", "GUARD_BASELINE", "STATE_DIR", "CACHE_DIR")}
+        reconcile.GUARD_PATHS = (self.pre,)
+        reconcile.STATE_DIR = os.path.join(self.dir, "state")
+        reconcile.CACHE_DIR = os.path.join(self.dir, "cache")
+        self.entry = {"name": "t", "gh": "example-org/app", "checkout": "/home/user/app", "branch": "main"}
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(reconcile, n, v)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _warnings(self):
+        with open(os.path.join(reconcile.STATE_DIR, "t.log"), encoding="utf-8") as fh:
+            return sum("already exists at pass start" in line for line in fh)
+
+    def test_every_pass_logs_the_preexisting_guard_warning(self):
+        master = "a" * 40
+        reconcile.save_state(self.entry, {"prod": {"sha": master, "failed_sha": None}, "previews": {}})
+        with unittest.mock.patch.object(reconcile, "gather", lambda entry: (master, [], False)):
+            reconcile.run_pass(self.entry, False)
+            reconcile.run_pass(self.entry, False)
+            self.assertEqual(self._warnings(), 2)
+            os.unlink(reconcile.state_file("t"))
+            reconcile.run_pass(self.entry, False)  # a pass that stops at the missing state file still warns
+        self.assertEqual(self._warnings(), 3)
+
+
+class GuardFailureTests(unittest.TestCase):
+    """A guard path that appears during one deploy fails only that deploy (deploy_version returns)."""
+
+    def test_guard_failure_marks_only_that_deploy(self):
+        calls = []
+
+        def fake_build(entry, root, sha, prod, project, res):
+            calls.append(sha)
+            res["expected"] = "index-a.js"
+            res["url"] = "https://x.vercel.app"
+            return root
+
+        def fake_sh(name, args, cwd, timeout, env=None):
+            if "archive" in args:
+                open(args[args.index("-o") + 1], "w").close()  # the git archive step writes the tar
+            return ""
+
+        d = tempfile.mkdtemp(prefix="guardfail-")
+        saved = {n: getattr(reconcile, n) for n in ("CACHE_DIR", "STATE_DIR", "GUARD_PATHS", "GUARD_BASELINE")}
+        try:
+            reconcile.CACHE_DIR = os.path.join(d, "cache")
+            reconcile.STATE_DIR = os.path.join(d, "state")
+            reconcile.GUARD_PATHS = (os.path.join(d, "appears"),)
+            reconcile.GUARD_BASELINE = frozenset()
+            entry = {"name": "t", "scope": "my-team", "checkout": "/home/user/app", "strategy": "remote"}
+            with unittest.mock.patch.object(reconcile, "build_remote", fake_build), \
+                    unittest.mock.patch.object(reconcile, "sh", fake_sh), \
+                    unittest.mock.patch.object(reconcile, "poll_bundle", lambda n, u, e: (e, True)):
+                open(reconcile.GUARD_PATHS[0], "w").close()  # appears during this deploy
+                res = reconcile.deploy_version(entry, "c" * 40, False, "p", None, "https://x.vercel.app")
+        finally:
+            for n, v in saved.items():
+                setattr(reconcile, n, v)
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertFalse(res["verified"])
+        self.assertIn("FATAL", res["error"])
+        self.assertEqual(calls, ["c" * 40])
+
 
 
 if __name__ == "__main__":

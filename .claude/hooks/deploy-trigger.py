@@ -10,10 +10,11 @@ The reconciler is spawned fully detached (new session, stdio to DEVNULL) and thi
 once. It never fails the tool: every error is swallowed and the exit status is always 0.
 Kill switch: DEPLOY_HOOKS=0 does nothing.
 
-Matching is quoting-aware: the line is lexed with shlex, split on shell operators, and each simple
-command's leading env assignments and wrappers (nohup, time, exec, command) are skipped. So
-`cd x && git push`, `git -C /x push origin b` and `git -c k=v push` match, while `git log --grep
-push`, `gh pr view 3` and `echo git push` do not. Known miss: a push nested in `bash -c '...'`
+Matching is quoting-aware: the line is lexed with shlex, split on shell operators and braces, and each
+simple command's leading env assignments and wrappers (nohup, time, exec, command, and env with its
+options and VAR=val arguments) are skipped. So `cd x && git push`, `git -C /x push origin b`,
+`git -c k=v push`, `env FOO=1 git push` and `{ git push; }` match, while `git log --grep push`,
+`gh pr view 3` and `echo git push` do not. Known miss: a push nested in `bash -c '...'`
 is not seen; the session-start pass or a manual run catches it.
 """
 
@@ -29,10 +30,11 @@ RECONCILE = os.path.join(HERE, "deploy-reconcile.py")
 CONFIG_PATH = os.path.join(HERE, "deploy-hooks.local.json")
 STATE_DIR = os.path.expanduser("~/.local/state/deploy-hooks")
 GH_PR_WRITES = {"create", "merge", "close", "reopen", "ready"}
-WRAPPERS = {"nohup", "time", "exec", "command"}
+WRAPPERS = {"nohup", "time", "exec", "command", "env"}
+ENV_OPTS_WITH_ARG = {"-u", "--unset", "-C", "--chdir"}
 ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-OPERATOR_CHARS = set(";&|()")
-FALLBACK_SPLIT = re.compile(r"&&|\|\||[;|&()]")
+OPERATOR_CHARS = set(";&|(){}")
+FALLBACK_SPLIT = re.compile(r"&&|\|\||[;|&(){}]")
 
 
 def simple_commands(command):
@@ -60,9 +62,18 @@ def simple_commands(command):
 
 
 def _strip_prefix(words):
+    """Drop leading env assignments, wrappers, and env's own options and VAR=val arguments."""
     i = 0
-    while i < len(words) and (ENV_ASSIGN.match(words[i]) or words[i] in WRAPPERS):
-        i += 1
+    while i < len(words):
+        word = words[i]
+        if word == "env":
+            i += 1
+            while i < len(words) and (ENV_ASSIGN.match(words[i]) or words[i].startswith("-")):
+                i += 2 if words[i] in ENV_OPTS_WITH_ARG else 1
+        elif ENV_ASSIGN.match(word) or word in WRAPPERS:
+            i += 1
+        else:
+            break
     return words[i:]
 
 
