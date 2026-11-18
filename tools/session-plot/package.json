@@ -12,8 +12,10 @@
     "test": "tsx --test test/*.test.ts"
   },
   "devDependencies": {
+    "@types/jsdom": "30.0.0",
     "@types/node": "^26.6.6",
     "esbuild": "^0.28.2",
+    "jsdom": "30.1.3",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }

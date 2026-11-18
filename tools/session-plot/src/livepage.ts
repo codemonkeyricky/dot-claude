@@ -349,6 +349,8 @@ function renderCards(s: LiveSnapshot): void {
     cardEls.delete(id);
     cardHtmls.delete(id);
   }
+  // A toggle button with keyboard focus is replaced with its card; focus goes back to the new button.
+  let refocus: { id: string; mode: CardMode } | null = null;
   s.sessions.forEach((x, idx) => {
     const html = cardHtml(x);
     let el = cardEls.get(x.id);
@@ -356,6 +358,9 @@ function renderCards(s: LiveSnapshot): void {
       el = parseCard(html);
       cardEls.set(x.id, el);
     } else if (cardHtmls.get(x.id) !== html) {
+      const active = document.activeElement as HTMLElement | null;
+      const focusMode = active && el.contains(active) && active.tagName === "BUTTON" ? active.dataset.mode : undefined;
+      if (isCardMode(focusMode)) refocus = { id: x.id, mode: focusMode };
       const fresh = parseCard(html);
       el.replaceWith(fresh);
       el = fresh;
@@ -368,6 +373,13 @@ function renderCards(s: LiveSnapshot): void {
   // Anything else in the grid (the empty-state message) goes after the cards.
   const current = new Set<Element>(cardEls.values());
   for (const child of [...grid.children]) if (!current.has(child)) child.remove();
+  // Every card built here starts with an empty last-activity text. Fill it now, so a re-render
+  // from the kind chart or a toggle does not leave it blank until the next one-second tick.
+  tick();
+  if (refocus) {
+    const r: { id: string; mode: CardMode } = refocus;
+    cardEls.get(r.id)?.querySelector<HTMLButtonElement>(`button[data-mode="${r.mode}"]`)?.focus({ preventScroll: true });
+  }
 }
 
 function cardHtml(x: LiveSession): string {
