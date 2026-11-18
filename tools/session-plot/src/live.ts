@@ -34,6 +34,9 @@ const ACTIVE_MS = 120_000;
 const WINDOW_MIN = 60;
 const DEBOUNCE_MS = 1000;
 const POLL_MS = 2000;
+// With no file change, the snapshot is still recomputed this often, so "last hour", the 60-minute
+// axis and the 24 h window advance on an idle machine.
+const IDLE_MS = 30_000;
 
 // Per-message record, kept only while the message is inside the 24 h window (windowed totals).
 interface Msg {
@@ -155,6 +158,7 @@ export class LiveIndex extends EventEmitter {
   private lastEmit = 0;
   private watcher: FSWatcher | null = null;
   private poller: NodeJS.Timeout | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
   private latest: LiveSnapshot;
 
   constructor(root: string = PROJECTS_DIR) {
@@ -169,6 +173,8 @@ export class LiveIndex extends EventEmitter {
     this.prune();
     this.latest = this.compute();
     this.firstSnapshotMs = performance.now() - t0;
+    this.idleTimer = setInterval(() => this.refreshIdle(), IDLE_MS);
+    this.idleTimer.unref();
   }
 
   snapshot(): LiveSnapshot {
@@ -191,7 +197,18 @@ export class LiveIndex extends EventEmitter {
     return this.latest;
   }
 
+  // Prunes and recomputes with no file change, then tells subscribers. Runs every IDLE_MS, so a
+  // quiet machine still gets a snapshot whose clock and totals have moved on.
+  private refreshIdle(): void {
+    this.prune();
+    this.latest = this.compute();
+    const update: LiveUpdate = { snapshot: this.latest, changed: [] };
+    this.emit("update", update);
+  }
+
   close(): void {
+    if (this.idleTimer) clearInterval(this.idleTimer);
+    this.idleTimer = null;
     this.watcher?.close();
     this.watcher = null;
     if (this.poller) clearInterval(this.poller);
@@ -385,7 +402,10 @@ export class LiveIndex extends EventEmitter {
     let st = this.files.get(path);
     if (!st) st = this.newFile(path, loc, stat);
     try {
-      return this.readNew(st, stat) ? st.sessionId : null;
+      const changed = this.readNew(st, stat);
+      // A good read clears the warning state, so a later failure on this path warns again.
+      this.warned.delete(path);
+      return changed ? st.sessionId : null;
     } catch (err) {
       // The file is gone (ENOENT or ENOTDIR) between stat and read: forget it. A later walk or
       // watch event starts it over from the beginning if the file is back. Any other error keeps

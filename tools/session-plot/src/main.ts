@@ -1,4 +1,5 @@
 // Browser client. No external libraries; the chart is hand-built SVG.
+import { LatestRequest } from "./latest";
 import type { Kind, Series, SessionData, SessionSummary } from "./types";
 
 declare global {
@@ -445,10 +446,10 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 // Each selection gets a token; a response for an earlier selection is discarded when it arrives late.
-let selectToken = 0;
+const selection = new LatestRequest();
 
 async function selectSession(id: string): Promise<void> {
-  const token = ++selectToken;
+  const token = selection.start();
   try {
     const u = new URL(location.href);
     u.searchParams.set("session", id);
@@ -459,9 +460,9 @@ async function selectSession(id: string): Promise<void> {
   setStatus("Loading…");
   try {
     const d = await getJson<SessionData>(`/api/session/${encodeURIComponent(id)}`);
-    if (token === selectToken) renderSession(d);
+    if (selection.isCurrent(token)) renderSession(d);
   } catch (e) {
-    if (token === selectToken) setStatus(`Failed to load ${id}: ${(e as Error).message}`);
+    if (selection.isCurrent(token)) setStatus(`Failed to load ${id}: ${(e as Error).message}`);
   }
 }
 
@@ -473,10 +474,12 @@ let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 async function refreshCurrent(): Promise<void> {
   if (!current) return;
   const id = current.id;
+  // A user selection made while this refresh is in flight makes its result stale.
+  const token = selection.mark();
   lastRefresh = Date.now();
   try {
     const d = await getJson<SessionData>(`/api/session/${encodeURIComponent(id)}`);
-    if (current && current.id === id) renderSession(d);
+    if (selection.isCurrent(token) && current && current.id === id) renderSession(d);
   } catch {
     // keep the last good render; the next change event retries
   }

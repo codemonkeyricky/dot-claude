@@ -112,8 +112,14 @@ function readHeadLines(file: string, n: number): string[] {
   }
 }
 
-// Reads the last `bytes` bytes of the file as whole lines. The partial line at the cut is dropped;
-// a file smaller than `bytes` is read in full.
+// One byte at `pos`, or -1 when there is none.
+function byteAt(fd: number, pos: number): number {
+  const one = Buffer.alloc(1);
+  return readSync(fd, one, 0, 1, pos) === 1 ? one[0] : -1;
+}
+
+// Reads the last `bytes` bytes of the file as whole lines. The partial line at the cut is dropped
+// (unless the cut is at a line start); a file smaller than `bytes` is read in full.
 const TAIL_BYTES = 64 * 1024;
 function readTailLines(file: string, bytes: number = TAIL_BYTES): string[] {
   const fd = openSync(file, "r");
@@ -128,7 +134,8 @@ function readTailLines(file: string, bytes: number = TAIL_BYTES): string[] {
       got += n;
     }
     let text = buf.subarray(0, got).toString("utf8");
-    if (start > 0) {
+    // The cut lands on a line start when the byte before it is a newline: nothing is partial then.
+    if (start > 0 && byteAt(fd, start - 1) !== 10) {
       const nl = text.indexOf("\n");
       text = nl === -1 ? "" : text.slice(nl + 1);
     }
