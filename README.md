@@ -68,6 +68,44 @@ Install:
 
 After editing `.claude/scripts/executor-template.md` or `.claude/scripts/opus-reviewer.md`, run `python3 .claude/scripts/gen_executors.py --root .claude` in the repo to regenerate `.claude/agents/`, then `./deploy.sh`.
 
+## Deploy hooks
+
+Two hooks in `.claude/hooks/` deploy a repo's prod branch and open PRs to Vercel without a CI workflow:
+
+- `deploy-trigger.py` (PostToolUse on Bash) starts a pass when the command is `git push` or `gh pr create|merge|close|reopen|ready`. It also runs on every SessionStart, which catches up on merges done on github.com.
+- `deploy-reconcile.py` is the pass itself. It compares `origin/<branch>` and the open PR heads with the saved state, then deploys what is missing: prod, a preview per open PR, and cleanup of closed PRs. A pass lists up to 1000 open PRs; if gh returns that many, the list may be truncated, so that pass removes no aliases or previews.
+
+The reconciler is spawned fully detached and the trigger returns at once. It never fails the tool: every error is swallowed and the hook exits 0. Kill switch: `DEPLOY_HOOKS=0`.
+
+Host config is in `.claude/hooks/deploy-hooks.local.json`, which is gitignored. Copy `.claude/hooks/deploy-hooks.example.json` to that name and edit it. Each repo entry picks a `strategy`:
+
+- `remote` (default): vite builds the snapshot locally to learn the expected bundle name, then `vercel deploy` builds it remotely.
+- `prebuilt`: the repo's `build.command` runs in a snapshot, then `vercel deploy --prebuilt`.
+
+`build.env` is applied to the local build. For `remote` it is also passed to the remote build as `--build-env K=V`; `VERCEL_GIT_COMMIT_SHA` is always the deployed sha, and a `build.env` value for it is ignored with a warning.
+
+Each repo entry can also set:
+
+- `branch`: the prod branch to deploy (`origin/<branch>`). When it is absent, the reconciler reads the checkout's default branch from `refs/remotes/origin/HEAD` and falls back to `master` if that ref is missing.
+- `health`: gates a deploy on a JSON response after the bundle is verified.
+- `deploys_log: true`: appends prod deploys to a log.
+
+The top-level `deploys_log_path` sets where those log rows go (`~` is expanded). It defaults to `~/.local/state/deploy-hooks/deploys.jsonl`.
+
+A pass does nothing until the state file exists, so run `python3 -I .claude/hooks/deploy-reconcile.py --seed` once per repo.
+
+A failed snapshot is kept under `~/.cache/deploy-hooks` for debugging. Each pass deletes the older failed snapshots of that repo and keeps the newest one. A snapshot dir is named `<repo>-prod-` or `<repo>-pr-` plus 8 random characters, and only that exact shape is pruned, so a repo named `app` never prunes the snapshots of `app-pr` or `app-prod`.
+
+If a `~/.vercel` or `~/.env.local` appears during a pass, only the deploy that sees it fails: it is not recorded as verified, and the pass goes on with its remaining actions. A guard path that stays present also fails the later deploys that check it, until it is removed. Paths that already exist when the pass starts are not fatal; every pass logs a warning for each of them.
+
+Prod deploys go live before verification; a failed verification is recorded so a revert redeploys. The state keeps the failed sha as the prod sha with `"verified": false`, so reverting master to the previous sha differs from it and plans a prod redeploy. The failed sha itself is not retried, so a broken build does not loop; `--retry-failed` retries it on demand.
+
+A preview cleanup drops its state entry only when `vercel alias rm` succeeds or reports that the alias itself is not found or does not exist. An auth, scope or network error keeps the entry and logs an error, and the cleanup is retried on the next pass.
+
+Builds run with the reconciler's full environment (`build.env` adds to it and does not replace it), so a PR's build scripts can read your environment, tokens included. Only install hooks for repos whose PR branches you trust. Every command runs in its own process group, and a timed-out command is killed together with its whole group.
+
+State, per-repo logs and events are kept in `~/.local/state/deploy-hooks`. `deploy.sh` installs the hook files and registrations; the local config is never installed.
+
 ## Tests
 
 ```sh

@@ -1,0 +1,51 @@
+{
+  "deploys_log_path": "~/logs/deploy-hooks/deploys.jsonl",
+  "repos": [
+    {
+      "name": "app",
+      "gh": "example-org/app",
+      "checkout": "/home/user/app",
+      "scope": "my-team",
+      "branch": "main",
+      "strategy": "remote",
+      "deploys_log": true,
+      "prod": {
+        "project": "app",
+        "url": "https://app-abc.vercel.app"
+      },
+      "preview": {
+        "project": "app",
+        "alias": "app-pr-{n}.vercel.app"
+      },
+      "node_modules": [
+        "/home/user/app/node_modules"
+      ]
+    },
+    {
+      "name": "site",
+      "gh": "example-org/site",
+      "checkout": "/home/user/site",
+      "scope": "my-team",
+      "strategy": "prebuilt",
+      "prod": {
+        "project": "site",
+        "url": "https://site-abc.vercel.app"
+      },
+      "preview": {
+        "project": "site",
+        "alias": "site-pr-{n}.vercel.app"
+      },
+      "build": {
+        "command": ["node", "scripts/build.mjs", "{out}"],
+        "env": {
+          "KV_PUBLIC_BASE": "https://kv.example",
+          "npm_config_workspace_concurrency": "1"
+        }
+      },
+      "health": {
+        "path": "/api/health",
+        "expect": {"ok": true, "storage": "kv"}
+      }
+    }
+  ]
+}
