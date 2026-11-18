@@ -1,10 +1,12 @@
 {
+  "deploys_log_path": "~/logs/deploy-hooks/deploys.jsonl",
   "repos": [
     {
       "name": "app",
       "gh": "example-org/app",
       "checkout": "/home/user/app",
       "scope": "my-team",
+      "branch": "main",
       "strategy": "remote",
       "deploys_log": true,
       "prod": {

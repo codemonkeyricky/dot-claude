@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Idempotent deploy reconciler: replaces the GitHub Actions deploy workflows with local runs.
 
-Each pass compares the state in ~/.local/state/deploy-hooks/<name>.json with origin/master and
+Each pass compares the state in ~/.local/state/deploy-hooks/<name>.json with origin/<branch> and
 with the open same-repo PRs, then deploys what is missing:
-  prod     origin/master -> the Vercel prod project, verified against the live bundle
+  prod     origin/<branch> -> the Vercel prod project, verified against the live bundle
   preview  each open PR head -> a Vercel preview, aliased, verified, sticky PR comment
   cleanup  a PR that is no longer open -> its alias removed, state entry dropped
 
 State (per repo): {"prod": {"sha", "failed_sha"}, "previews": {"<N>": {"sha", "url", "bundle",
 "failed_sha"}}}. A failed sha is not retried until the ref moves to a new sha, unless run with --retry-failed.
 
-Config per repo (deploy-hooks.local.json): "strategy" "remote" (default: vite build here, vercel
+Config per repo (deploy-hooks.local.json): "branch" the prod branch (default: the checkout's
+origin/HEAD, else master); "strategy" "remote" (default: vite build here, vercel
 deploy builds remotely) or "prebuilt" (build.command in a snapshot, then vercel deploy --prebuilt);
 "deploys_log": true appends prod deploys to ~/.local/state/deploy-hooks/deploys.jsonl
 (override the path with top-level "deploys_log_path"); "health":
@@ -18,8 +19,8 @@ deploy builds remotely) or "prebuilt" (build.command in a snapshot, then vercel 
 
 CLI: python3 -I deploy-reconcile.py [--repo NAME] [--dry-run] [--seed] [--force-prod] [--retry-failed]
   --dry-run       print the planned actions as JSON, deploy nothing
-  --seed          record origin/master and the open PR heads as already deployed, deploy nothing
-  --force-prod    also deploy origin/master to prod even when it is already recorded
+  --seed          record origin/<branch> and the open PR heads as already deployed, deploy nothing
+  --force-prod    also deploy origin/<branch> to prod even when it is already recorded
   --retry-failed  plan a prod or preview sha recorded in failed_sha again (prod and previews)
 A pass does nothing until the state file exists (run --seed first).
 """
@@ -43,9 +44,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "deploy-hooks.local.json")
 STATE_DIR = os.path.expanduser("~/.local/state/deploy-hooks")
 CACHE_DIR = os.path.expanduser("~/.cache/deploy-hooks")
-DEPLOYS_LOG = os.path.expanduser("~/.local/state/deploy-hooks/deploys.jsonl")
+DEFAULT_DEPLOYS_LOG = os.path.join(STATE_DIR, "deploys.jsonl")
+DEPLOYS_LOG = DEFAULT_DEPLOYS_LOG
 EVENTS_LOG = os.path.join(STATE_DIR, "events.jsonl")
 GUARD_PATHS = (os.path.expanduser("~/.vercel"), os.path.expanduser("~/.env.local"))
+# Paths of GUARD_PATHS that existed when the current pass started (see record_guard_baseline).
+GUARD_BASELINE = frozenset()
+FALLBACK_BRANCH = "master"
+PR_LIST_LIMIT = 1000
+MAX_EXTRA_PASSES = 5
 BUNDLE_RE = re.compile(r'assets/index-[^"]*\.js')
 URL_RE = re.compile(r"https://[A-Za-z0-9.-]+\.vercel\.app")
 ALIAS_GONE_RE = re.compile(r"(?i)not.?found|does not exist|no such alias")
@@ -65,13 +72,14 @@ class DeployError(Exception):
 
 # ----------------------------------------------------------------- pure helpers
 
-def plan(state, master_sha, open_prs, force_prod=False, retry_failed=False):
+def plan(state, master_sha, open_prs, force_prod=False, retry_failed=False, cleanup=True):
     """Pure planner: (state, master sha, open PRs) -> ordered list of action dicts.
 
     state None (no state file) plans nothing. open_prs None (gh failed) plans no previews and no
     cleanups. Cross-repo PRs are ignored. Order: prod, then previews, then cleanups.
     force_prod redeploys prod even when master is already recorded. retry_failed plans a sha
-    recorded in failed_sha again (prod and previews) instead of skipping it.
+    recorded in failed_sha again (prod and previews) instead of skipping it. cleanup=False
+    plans no cleanups (used when the PR list may be truncated).
     """
     if state is None:
         return []
@@ -93,9 +101,10 @@ def plan(state, master_sha, open_prs, force_prod=False, retry_failed=False):
         rec = previews.get(n) or {}
         if head and head != rec.get("sha") and (retry_failed or head != rec.get("failed_sha")):
             actions.append({"kind": "preview", "pr": int(n), "sha": head})
-    for n in sorted(previews, key=int):
-        if n not in seen:
-            actions.append({"kind": "cleanup", "pr": int(n)})
+    if cleanup:
+        for n in sorted(previews, key=int):
+            if n not in seen:
+                actions.append({"kind": "cleanup", "pr": int(n)})
     return actions
 
 
@@ -135,6 +144,28 @@ def bundle_from_html(body):
 
 def alias_for(entry, n):
     return entry["preview"]["alias"].replace("{n}", str(n))
+
+
+def branch_of(entry):
+    """The prod branch: the entry's "branch" key when set, else the default branch of the checkout
+    (refs/remotes/origin/HEAD, "origin/" stripped), else FALLBACK_BRANCH. Never raises."""
+    explicit = entry.get("branch")
+    if explicit:
+        return str(explicit)
+    checkout = entry.get("checkout") or "."
+    rc, out = run(["git", "-C", checkout, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                  checkout, TIMEOUT_CMD)
+    ref = (out or "").strip() if rc == 0 else ""
+    prefix = "origin/"
+    if ref.startswith(prefix) and len(ref) > len(prefix):
+        return ref[len(prefix):]
+    return FALLBACK_BRANCH
+
+
+def resolve_deploys_log_path(cfg):
+    """Top-level deploys_log_path with ~ expanded, else the default deploys log path."""
+    raw = cfg.get("deploys_log_path")
+    return os.path.expanduser(str(raw)) if raw else DEFAULT_DEPLOYS_LOG
 
 
 def strategy_of(entry):
@@ -259,12 +290,47 @@ def vercel(name, args, cwd, timeout):
     return sh(name, ["vercel", *args], cwd, timeout)
 
 
+def record_guard_baseline(name):
+    """Remember which GUARD_PATHS exist now (the start of a pass). Those are not fatal: each gets
+    a warning in the log. Only a guard path that appears later in the pass is FATAL."""
+    global GUARD_BASELINE
+    GUARD_BASELINE = frozenset(p for p in GUARD_PATHS if os.path.exists(p))
+    for p in sorted(GUARD_BASELINE):
+        log(name, f"warning: {p} already exists at pass start; not fatal, but vercel should not write it")
+    return GUARD_BASELINE
+
+
 def guard_home():
-    """Vercel runs must not create ~/.vercel or ~/.env.local. Returns an error string or None."""
-    bad = [p for p in GUARD_PATHS if os.path.exists(p)]
-    if not bad:
+    """Vercel runs must not create ~/.vercel or ~/.env.local. Returns an error string for guard paths
+    that appeared since record_guard_baseline, or None."""
+    appeared = [p for p in GUARD_PATHS if os.path.exists(p) and p not in GUARD_BASELINE]
+    if not appeared:
         return None
-    return "FATAL: " + ", ".join(bad) + " exists (a vercel command ran outside the snapshot)"
+    return "FATAL: " + ", ".join(appeared) + " appeared during the pass (a vercel command ran outside the snapshot)"
+
+
+def prune_failed_snapshots(name):
+    """Delete the failed snapshot dirs of repo name under CACHE_DIR, keeping the most recent one for
+    debugging. Symlinks are never followed; every deletion is checked to resolve under CACHE_DIR.
+    Returns the list of removed paths."""
+    base = os.path.realpath(CACHE_DIR)
+    if not os.path.isdir(base):
+        return []
+    pat = re.compile(r"^" + re.escape(name) + r"-(prod|pr)-")
+    dirs = []
+    for entry_name in os.listdir(base):
+        path = os.path.join(base, entry_name)
+        if pat.match(entry_name) and os.path.isdir(path) and not os.path.islink(path):
+            dirs.append(path)
+    dirs.sort(key=os.path.getmtime, reverse=True)
+    removed = []
+    for path in dirs[1:]:
+        real = os.path.realpath(path)
+        if not real.startswith(base + os.sep):
+            raise RuntimeError(f"refusing to delete outside the snapshot dir: {real}")
+        shutil.rmtree(real, ignore_errors=True)
+        removed.append(path)
+    return removed
 
 
 def append_jsonl(path, obj):
@@ -414,8 +480,8 @@ def build_remote(entry, root, sha, prod, project, res):
     snap = os.path.join(root, "snap")
     os.symlink(first_node_modules(entry), os.path.join(snap, "node_modules"))
     # The bundle hash depends on the sha (vite.config.ts defines __BUILD_SHA__), so the local
-    # build and the remote build must both see VERCEL_GIT_COMMIT_SHA=<sha>.
-    env = dict(os.environ, VERCEL_GIT_COMMIT_SHA=sha)
+    # build and the remote build must both see VERCEL_GIT_COMMIT_SHA=<sha>. build.env applies too.
+    env = build_env(entry, sha)
     sh(name, ["npx", "vite", "build"], snap, TIMEOUT_BUILD, env=env)
     assets = sorted(glob.glob(os.path.join(snap, "dist", "assets", "index-*.js")))
     if not assets:
@@ -614,7 +680,9 @@ def cleanup_preview(entry, n, st):
 # ----------------------------------------------------------------- passes
 
 def gather(entry):
-    """Fetch, then return (origin/master sha, open PRs or None when gh fails)."""
+    """Fetch, then return (origin/<branch> sha, open PRs or None when gh fails, truncated). truncated
+    is True when gh returned PR_LIST_LIMIT PRs, so the list may be incomplete: the pass then removes
+    no aliases or previews."""
     name = entry["name"]
     # PR heads go under refs/pr-heads/* (outside refs/remotes) so they never show up as
     # remote branches in `git branch -r` or the status "unmerged" list. No --prune here:
@@ -624,30 +692,34 @@ def gather(entry):
         git(entry, ["fetch", "origin", "+refs/pull/*/head:refs/pr-heads/*"], TIMEOUT_CMD)
     except DeployError as e:
         log(name, f"warning: PR head fetch failed: {e}")
-    master = git(entry, ["rev-parse", "origin/master"]).strip()
+    master = git(entry, ["rev-parse", f"origin/{branch_of(entry)}"]).strip()
     try:
         raw = sh(name, ["gh", "pr", "list", "-R", entry["gh"], "--state", "open",
-                        "--json", "number,headRefOid,isCrossRepository", "--limit", "100"],
+                        "--json", "number,headRefOid,isCrossRepository", "--limit", str(PR_LIST_LIMIT)],
                  STATE_DIR, TIMEOUT_CMD)
         open_prs = json.loads(raw.strip() or "[]")
     except (DeployError, ValueError) as e:
         log(name, f"gh pr list failed; no preview or cleanup this pass: {e}")
         open_prs = None
-    return master, open_prs
+    truncated = open_prs is not None and len(open_prs) >= PR_LIST_LIMIT
+    if truncated:
+        log(name, f"warning: gh pr list returned {len(open_prs)} PRs (the limit); the list may be truncated, "
+                  f"so no alias or preview removal this pass")
+    return master, open_prs, truncated
 
 
-def decide(st, master, open_prs, force_prod, retry_failed=False):
+def decide(st, master, open_prs, force_prod, retry_failed=False, cleanup=True):
     if st is None:
         return []
-    return plan(st, master, open_prs, force_prod, retry_failed)
+    return plan(st, master, open_prs, force_prod, retry_failed, cleanup)
 
 
 def dry_run(entry, force_prod, retry_failed=False):
     st = load_state(entry)
-    master, open_prs = gather(entry)
-    actions = decide(st, master, open_prs, force_prod, retry_failed)
+    master, open_prs, truncated = gather(entry)
+    actions = decide(st, master, open_prs, force_prod, retry_failed, cleanup=not truncated)
     out = {"repo": entry["name"], "master": master, "state_present": st is not None,
-           "open_prs": open_prs, "actions": actions}
+           "open_prs": open_prs, "truncated": truncated, "actions": actions}
     if st is None:
         out["note"] = "no state file: a real pass does nothing until --seed"
     print(json.dumps(out, indent=2))
@@ -655,7 +727,7 @@ def dry_run(entry, force_prod, retry_failed=False):
 
 def seed(entry):
     name = entry["name"]
-    master, open_prs = gather(entry)
+    master, open_prs, _truncated = gather(entry)
     if open_prs is None:
         raise DeployError("gh pr list failed; cannot seed")
     st = {"prod": {"sha": master, "failed_sha": None}, "previews": {}}
@@ -674,8 +746,9 @@ def run_pass(entry, force_prod, retry_failed=False):
     if st is None:
         log(name, "no state file: run --seed first; nothing deployed")
         return
-    master, open_prs = gather(entry)
-    actions = decide(st, master, open_prs, force_prod, retry_failed)
+    record_guard_baseline(name)
+    master, open_prs, truncated = gather(entry)
+    actions = decide(st, master, open_prs, force_prod, retry_failed, cleanup=not truncated)
     log(name, f"pass: master {master[:7]}, open PRs {None if open_prs is None else len(open_prs)}, "
               f"actions {actions}")
     for act in actions:
@@ -689,22 +762,36 @@ def run_pass(entry, force_prod, retry_failed=False):
         except Exception:  # noqa: BLE001
             log(name, f"action {act} crashed:\n" + traceback.format_exc())
         save_state(entry, st)
+    try:
+        for path in prune_failed_snapshots(name):
+            log(name, f"pruned failed snapshot {path}")
+    except Exception:  # noqa: BLE001
+        log(name, "failed snapshot prune crashed:\n" + traceback.format_exc())
     log(name, "pass done")
 
 
 def locked_pass(entry, force_prod, retry_failed=False):
+    """Run a pass under the per-repo lock, re-running while a rerun marker is queued.
+
+    The marker is touched before the lock is tried, so a refused trigger always leaves it behind
+    before the holder can release. After each pass the lock is released and the marker re-checked:
+    if it is set, the lock is taken again and another pass runs (at most MAX_EXTRA_PASSES extra).
+    If the re-take fails, another process holds the lock and clears the marker when its pass starts.
+    """
     name = entry["name"]
     rerun = os.path.join(STATE_DIR, name + ".rerun")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    touch(rerun)
     fd = acquire(entry)
     if fd is None and lock_mode(force_prod, retry_failed) == "block":
         log(name, "waiting for running pass…")
         fd = acquire(entry, block=True)
     if fd is None:
-        touch(rerun)
         log(name, "a pass is running; queued a rerun")
         return
     try:
         time.sleep(PASS_DELAY)
+        extra = 0
         while True:
             unlink_quiet(rerun)
             try:
@@ -713,16 +800,19 @@ def locked_pass(entry, force_prod, retry_failed=False):
                 log(name, "pass crashed:\n" + traceback.format_exc())
             force_prod = False
             retry_failed = False
-            if os.path.exists(rerun):
-                continue
             fcntl.flock(fd, fcntl.LOCK_UN)
             if not os.path.exists(rerun):
                 break
-            # A trigger landed between the check and the unlock: take the lock back and go again.
+            if extra >= MAX_EXTRA_PASSES:
+                log(name, f"rerun still queued after {MAX_EXTRA_PASSES} extra passes; "
+                          f"left for the next trigger")
+                break
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 break
+            extra += 1
+            log(name, f"queued rerun found after release; running pass {extra + 1}")
     finally:
         os.close(fd)
 
@@ -733,7 +823,7 @@ def main(argv=None):
     ap.add_argument("--repo", help="only this repo name from deploy-hooks.local.json")
     ap.add_argument("--dry-run", action="store_true", help="print planned actions, deploy nothing")
     ap.add_argument("--seed", action="store_true", help="record current state as deployed, deploy nothing")
-    ap.add_argument("--force-prod", action="store_true", help="deploy origin/master to prod even if recorded")
+    ap.add_argument("--force-prod", action="store_true", help="deploy origin/<branch> to prod even if recorded")
     ap.add_argument("--retry-failed", action="store_true",
                     help="plan a prod or preview sha that failed before (failed_sha) again")
     args = ap.parse_args(argv)
@@ -742,8 +832,7 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         print(f"cannot read {CONFIG_PATH}: {e}", file=sys.stderr)
         return 2
-    if cfg.get("deploys_log_path"):
-        DEPLOYS_LOG = os.path.expanduser(str(cfg["deploys_log_path"]))
+    DEPLOYS_LOG = resolve_deploys_log_path(cfg)
     repos = [r for r in cfg.get("repos") or [] if not args.repo or r.get("name") == args.repo]
     if not repos:
         print("no matching repo in config", file=sys.stderr)

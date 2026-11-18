@@ -70,10 +70,10 @@ After editing `.claude/scripts/executor-template.md` or `.claude/scripts/opus-re
 
 ## Deploy hooks
 
-Two hooks in `.claude/hooks/` deploy this repo's `main` and open PRs to Vercel without a CI workflow:
+Two hooks in `.claude/hooks/` deploy a repo's prod branch and open PRs to Vercel without a CI workflow:
 
 - `deploy-trigger.py` (PostToolUse on Bash) starts a pass when the command is `git push` or `gh pr create|merge|close|reopen|ready`. It also runs on every SessionStart, which catches up on merges done on github.com.
-- `deploy-reconcile.py` is the pass itself. It compares `origin/main` and the open PR heads with the saved state, then deploys what is missing: prod, a preview per open PR, and cleanup of closed PRs.
+- `deploy-reconcile.py` is the pass itself. It compares `origin/<branch>` and the open PR heads with the saved state, then deploys what is missing: prod, a preview per open PR, and cleanup of closed PRs. A pass lists up to 1000 open PRs; if gh returns that many, the list may be truncated, so that pass removes no aliases or previews.
 
 The reconciler is spawned fully detached and the trigger returns at once. It never fails the tool: every error is swallowed and the hook exits 0. Kill switch: `DEPLOY_HOOKS=0`.
 
@@ -82,7 +82,17 @@ Host config is in `.claude/hooks/deploy-hooks.local.json`, which is gitignored. 
 - `remote` (default): vite builds the snapshot locally to learn the expected bundle name, then `vercel deploy` builds it remotely.
 - `prebuilt`: the repo's `build.command` runs in a snapshot, then `vercel deploy --prebuilt`.
 
-A repo can set `health` to gate a deploy on a JSON response, and `deploys_log: true` to append prod deploys to a log (`deploys_log_path` overrides its location). A pass does nothing until the state file exists, so run `python3 -I .claude/hooks/deploy-reconcile.py --seed` once per repo.
+Each repo entry can also set:
+
+- `branch`: the prod branch to deploy (`origin/<branch>`). When it is absent, the reconciler reads the checkout's default branch from `refs/remotes/origin/HEAD` and falls back to `master` if that ref is missing.
+- `health`: gates a deploy on a JSON response after the bundle is verified.
+- `deploys_log: true`: appends prod deploys to a log.
+
+The top-level `deploys_log_path` sets where those log rows go (`~` is expanded). It defaults to `~/.local/state/deploy-hooks/deploys.jsonl`.
+
+A pass does nothing until the state file exists, so run `python3 -I .claude/hooks/deploy-reconcile.py --seed` once per repo.
+
+A failed snapshot is kept under `~/.cache/deploy-hooks` for debugging. Each pass deletes the older failed snapshots of that repo and keeps the newest one. If a `~/.vercel` or `~/.env.local` appears during a pass, the pass fails. Paths that already exist when the pass starts only get a warning in the log.
 
 State, per-repo logs and events are kept in `~/.local/state/deploy-hooks`. `deploy.sh` installs the hook files and registrations; the local config is never installed.
 
