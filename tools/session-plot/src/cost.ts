@@ -48,6 +48,21 @@ export function priceFor(model: string): ModelPrice | null {
   return best === null ? null : models[best];
 }
 
+// 5m/1h cache-creation split from usage.cache_creation. Without it, all cache creation is 5m.
+// The 1h part is taken as given; the 5m part is ephemeral_5m when present, else what is left of
+// cache_creation_input_tokens after 1h. Any remainder not covered by the split is treated as 5m,
+// so a split that only carries the 1h count never double-counts.
+export function cacheSplit(usage: Record<string, unknown>): { w5: number; w1: number } {
+  const cc = num(usage.cache_creation_input_tokens);
+  const split = usage.cache_creation;
+  const s = split && typeof split === "object" ? (split as Record<string, unknown>) : null;
+  const w1 = s ? Math.max(0, num(s.ephemeral_1h_input_tokens)) : 0;
+  let w5 = s && typeof s.ephemeral_5m_input_tokens === "number" ? num(s.ephemeral_5m_input_tokens) : Math.max(0, cc - w1);
+  const rest = cc - w1 - w5;
+  if (rest > 0) w5 += rest;
+  return { w5, w1 };
+}
+
 export function turnCost(model: string | undefined, usage: Record<string, unknown>): TurnCost {
   // Synthetic placeholder messages are not billed and are not "unpriced".
   if (!model || model.startsWith("<")) return { usd: 0, unpriced: false };
@@ -65,6 +80,10 @@ export function turnCost(model: string | undefined, usage: Record<string, unknow
   if (usage.speed === "fast" && p.fast) {
     rIn = p.fast.in;
     rOut = p.fast.out;
+    // Prompt-caching multipliers apply on top of fast pricing: cache read keeps the standard
+    // cache-read/input ratio of the model, applied to the fast input rate. Cache writes already
+    // use rIn (fast), so 5m = 1.25x and 1h = 2x fast input.
+    rCr = p.in > 0 ? p.fast.in * (p.cacheRead / p.in) : 0;
   }
   if (p.longPrompt && input + cc + cr > p.longPrompt.over) {
     rIn = p.longPrompt.in;
@@ -72,18 +91,7 @@ export function turnCost(model: string | undefined, usage: Record<string, unknow
     rCr = p.longPrompt.cacheRead;
   }
 
-  // 5m/1h split from usage.cache_creation. Without it, all cache creation is 5m.
-  // Any part of cache_creation_input_tokens not covered by the split is treated as 5m.
-  let w5 = cc;
-  let w1 = 0;
-  const split = usage.cache_creation;
-  if (split && typeof split === "object") {
-    const s = split as Record<string, unknown>;
-    w5 = num(s.ephemeral_5m_input_tokens);
-    w1 = num(s.ephemeral_1h_input_tokens);
-    const rest = cc - w5 - w1;
-    if (rest > 0) w5 += rest;
-  }
+  const { w5, w1 } = cacheSplit(usage);
 
   const usd =
     (input * rIn +

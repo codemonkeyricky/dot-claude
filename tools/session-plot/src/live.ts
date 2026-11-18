@@ -11,6 +11,7 @@ import {
   statSync,
   watch,
   type FSWatcher,
+  type Stats,
 } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { turnCost } from "./cost";
@@ -50,12 +51,15 @@ interface FileState {
   projectDir: string;
   sessionId: string;
   agentId: string | null; // null for the main transcript
+  dev: number; // device and inode at the last read: a different pair means the file was replaced
+  ino: number;
+  mtime: number; // epoch ms at the last read
   offset: number; // bytes consumed so far
   partial: Buffer; // trailing bytes without a newline yet
   msgs: Map<string, Msg>;
   lastActivity: number; // epoch ms, newest timestamp seen
   anon: number;
-  custom?: string;
+  custom?: string; // last custom-title seen
   summary?: string;
   firstUser?: string;
   label: string;
@@ -113,6 +117,8 @@ export class LiveIndex extends EventEmitter {
 
   constructor(root: string = PROJECTS_DIR) {
     super();
+    // One SSE subscriber per open tab; the default limit of 10 would warn with more tabs.
+    this.setMaxListeners(0);
     this.root = root;
     const t0 = performance.now();
     // Start watching before the scan so nothing written during the scan is missed.
@@ -132,6 +138,14 @@ export class LiveIndex extends EventEmitter {
 
   sessionCount(): number {
     return this.sessions.size;
+  }
+
+  // Re-scans the tree, prunes, and recomputes the snapshot now (no debounce, no event).
+  refreshNow(): LiveSnapshot {
+    this.walk(Date.now() - DAY);
+    this.prune();
+    this.latest = this.compute();
+    return this.latest;
   }
 
   close(): void {
@@ -203,9 +217,34 @@ export class LiveIndex extends EventEmitter {
     const changed = [...this.pending];
     this.pending.clear();
     if (changed.length === 0) return;
+    this.prune();
     this.latest = this.compute();
     const update: LiveUpdate = { snapshot: this.latest, changed };
     this.emit("update", update);
+  }
+
+  // Keeps memory bounded to the 24 h window: messages older than the cutoff are dropped, files
+  // that are older than the cutoff and have nothing left are forgotten, and sessions with no
+  // files left are removed. A forgotten file is read again from the start if it is written to.
+  private prune(): void {
+    const cutoff = Date.now() - DAY;
+    for (const [path, st] of this.files) {
+      for (const [key, m] of st.msgs) if (m.t < cutoff) st.msgs.delete(key);
+      if (st.mtime < cutoff && st.msgs.size === 0) {
+        this.files.delete(path);
+        const sess = this.sessions.get(`${st.projectDir}/${st.sessionId}`);
+        if (sess) {
+          if (st.agentId === null) {
+            if (sess.main === st) sess.main = null;
+          } else if (sess.subs.get(st.agentId) === st) {
+            sess.subs.delete(st.agentId);
+          }
+        }
+      }
+    }
+    for (const [key, sess] of this.sessions) {
+      if (sess.main === null && sess.subs.size === 0) this.sessions.delete(key);
+    }
   }
 
   // Scans the projects tree. Files older than cutoff are skipped unless already tracked, or
@@ -266,23 +305,26 @@ export class LiveIndex extends EventEmitter {
   private ingestPath(path: string): string | null {
     const loc = locate(this.root, path);
     if (!loc) return null;
-    let size: number;
+    let stat: Stats;
     try {
-      size = statSync(path).size;
+      stat = statSync(path);
     } catch {
       return null;
     }
     let st = this.files.get(path);
-    if (!st) st = this.newFile(path, loc);
-    return this.readNew(st, size) ? st.sessionId : null;
+    if (!st) st = this.newFile(path, loc, stat);
+    return this.readNew(st, stat) ? st.sessionId : null;
   }
 
-  private newFile(path: string, loc: Locator): FileState {
+  private newFile(path: string, loc: Locator, stat: Stats): FileState {
     const st: FileState = {
       path,
       projectDir: loc.projectDir,
       sessionId: loc.sessionId,
       agentId: loc.agentId,
+      dev: stat.dev,
+      ino: stat.ino,
+      mtime: stat.mtimeMs,
       offset: 0,
       partial: Buffer.alloc(0),
       msgs: new Map(),
@@ -303,9 +345,16 @@ export class LiveIndex extends EventEmitter {
     return st;
   }
 
-  private readNew(st: FileState, size: number): boolean {
-    if (size < st.offset) {
-      // Truncated or replaced: start over from the beginning.
+  private readNew(st: FileState, stat: Stats): boolean {
+    const size = stat.size;
+    let changed = false;
+    // A new inode (delete + recreate, or rename over) or a shorter file (truncate) means the
+    // content we consumed is gone: drop what we derived from it and read from the start.
+    const replaced = stat.ino !== st.ino || stat.dev !== st.dev;
+    st.mtime = stat.mtimeMs;
+    if (replaced || size < st.offset) {
+      st.dev = stat.dev;
+      st.ino = stat.ino;
       st.offset = 0;
       st.partial = Buffer.alloc(0);
       st.msgs.clear();
@@ -314,8 +363,9 @@ export class LiveIndex extends EventEmitter {
       st.custom = undefined;
       st.summary = undefined;
       st.firstUser = undefined;
+      changed = true;
     }
-    if (size === st.offset) return false;
+    if (size === st.offset) return changed;
 
     const want = size - st.offset;
     const buf = Buffer.alloc(want);
@@ -336,7 +386,7 @@ export class LiveIndex extends EventEmitter {
     const nl = data.lastIndexOf(10);
     if (nl < 0) {
       st.partial = Buffer.from(data);
-      return false;
+      return changed;
     }
     st.partial = Buffer.from(data.subarray(nl + 1));
     const text = data.subarray(0, nl).toString("utf8");
@@ -347,20 +397,28 @@ export class LiveIndex extends EventEmitter {
 
   private absorb(st: FileState, line: string): void {
     if (line.length === 0) return;
-    const tsm = /"timestamp":"([^"]+)"/.exec(line);
-    const ts = tsm ? Date.parse(tsm[1]) : NaN;
-    if (Number.isFinite(ts) && ts > st.lastActivity) st.lastActivity = ts;
-
     const assistant = line.includes('"type":"assistant"');
     const wantsTitle =
       (st.firstUser === undefined && line.includes('"type":"user"')) ||
-      (st.custom === undefined && line.includes('"custom-title"')) ||
+      line.includes('"custom-title"') ||
       (st.summary === undefined && line.includes('"summary"'));
-    if (!assistant && !wantsTitle) return;
 
-    const o = parseLine(line);
+    // Lines we parse take the top-level timestamp. Other lines fall back to a regex, which can
+    // match a nested "timestamp" (e.g. inside tool_use input), so it is only used when unparsed.
+    const o = assistant || wantsTitle ? parseLine(line) : null;
+    let ts = NaN;
+    if (o) {
+      ts = typeof o.timestamp === "string" ? Date.parse(o.timestamp) : NaN;
+    } else {
+      const tsm = /"timestamp":"([^"]+)"/.exec(line);
+      ts = tsm ? Date.parse(tsm[1]) : NaN;
+    }
+    if (Number.isFinite(ts) && ts > st.lastActivity) st.lastActivity = ts;
+
+    if (!assistant && !wantsTitle) return;
     if (!o) return;
-    if (o.type === "custom-title" && typeof o.customTitle === "string" && o.customTitle.trim() && st.custom === undefined) {
+    // The last custom-title record wins: a rename appends a new one.
+    if (o.type === "custom-title" && typeof o.customTitle === "string" && o.customTitle.trim()) {
       st.custom = o.customTitle.trim();
     }
     if (o.type === "summary" && typeof o.summary === "string" && o.summary.trim() && st.summary === undefined) {

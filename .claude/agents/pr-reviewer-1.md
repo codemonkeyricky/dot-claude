@@ -1,5 +1,5 @@
 ---
-# GENERATED from opus-reviewer.md by python3 scripts/gen_executors.py --root . (from the repo root) - do not edit by hand
+# GENERATED from opus-reviewer.md by python3 .claude/scripts/gen_executors.py --root .claude (from the repo root) - do not edit by hand
 name: pr-reviewer-1
 description: Reviewer (PR Reviewer 1) — Reviews a pull request with the code-review skill on Opus before it leaves draft, ending with a machine-read REVIEW-VERDICT line. Give it the PR (owner/repo#N or URL) and the local checkout path. Read-only: never edits, pushes or marks ready.
 model: opus

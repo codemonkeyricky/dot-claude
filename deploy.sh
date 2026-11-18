@@ -3,22 +3,31 @@
 # into ${CLAUDE_DIR:-$HOME/.claude}. Paths inside .claude/ map to the same relative paths in the
 # target: .claude/hooks/x.py installs to <target>/hooks/x.py. Nothing outside .claude/ is installed.
 # Copies tracked files and never deletes anything in the target directory.
-# settings.json is deep-merged, not copied: keys from the repo win, other keys
+# The repo's settings file is .claude/settings.harness.json (not settings.json, so Claude Code
+# does not load it as project settings when run inside this repo). It is deep-merged into the
+# target's settings.json, not copied: keys from the repo win, other keys
 # already in the target are kept (dicts merge recursively; lists are replaced).
-# The merge runs first in every mode, so a bad settings.json stops the script before
-# any file is copied. The merged file keeps the mode of the settings.json it replaces.
-# If settings.json is a symlink, the merged file is written to the real file it points
-# to, so the symlink stays in place.
+# The merge runs first in every mode, so a bad settings file stops the script before
+# any file is copied. The merged file keeps the mode of the target settings.json it replaces.
+# If the target settings.json is a symlink, the merged file is written to the real file it
+# points to, so the symlink stays in place.
 #
-#   ./deploy.sh            copy tracked files and merge settings.json into the target
+#   ./deploy.sh            copy tracked files and merge settings.harness.json into the target settings.json
 #   ./deploy.sh --dry-run  list what would change, change nothing
 #   ./deploy.sh --diff     show unified diffs target -> repo, change nothing
 set -euo pipefail
 
+# CLAUDE_DIR is relative to the caller's working directory, so resolve it to an absolute path
+# before the cd calls below move us into the repo.
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+case "$CLAUDE_DIR" in
+  /*) ;;
+  *) CLAUDE_DIR="$PWD/$CLAUDE_DIR" ;;
+esac
+
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # Everything below works relative to the harness directory in this repo.
 cd .claude
-CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 
 mode=install
 case "${1:-}" in
@@ -29,18 +38,19 @@ case "${1:-}" in
 esac
 
 # Tracked files that get deployed: git ls-files run inside .claude/ lists paths relative to it.
-# settings.json is merged separately, so it is excluded (and .gitignore, if one exists there).
+# settings.harness.json is merged separately, so it is excluded (and .gitignore, if one exists there).
+# It is never copied as a plain file: it lands in the target only as the merged settings.json.
 list_files() {
-  git ls-files | grep -vxF -e .gitignore -e settings.json || true
+  git ls-files | grep -vxF -e .gitignore -e settings.harness.json || true
 }
 
-# Write the merged settings.json (target deep-merged with the repo copy) to the file given as
-# $1, and copy the mode of $2 onto it when $2 exists. $2 is the real destination (a symlink
-# is resolved by the caller). A missing target is treated as {}. Invalid JSON in either file,
-# or a top-level value that is not an object, exits nonzero with a message naming the file,
+# Write the merged settings.json (target deep-merged with the repo settings.harness.json) to the
+# file given as $1, and copy the mode of $2 onto it when $2 exists. $2 is the real destination (a
+# symlink is resolved by the caller). A missing target is treated as {}. Invalid JSON in either
+# file, or a top-level value that is not an object, exits nonzero with a message naming the file,
 # and nothing is written.
 merge_settings() {
-  python3 -I - "$CLAUDE_DIR/settings.json" settings.json "$1" "$2" <<'PY'
+  python3 -I - "$CLAUDE_DIR/settings.json" settings.harness.json "$1" "$2" <<'PY'
 import json
 import os
 import stat
@@ -70,7 +80,7 @@ def load(path, label):
 
 target, repo, out, dest = sys.argv[1:5]
 existing = load(target, "target settings.json") if os.path.exists(target) else {}
-incoming = load(repo, "repo settings.json")
+incoming = load(repo, "repo settings.harness.json")
 text = json.dumps(merge(existing, incoming), indent=2) + "\n"
 with open(out, "w", encoding="utf-8") as f:
     f.write(text)

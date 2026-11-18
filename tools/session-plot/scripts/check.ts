@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { listSessions, parseLine, parseSessionDetailed, PROJECTS_DIR } from "../src/parse";
-import { priceFor, turnCost } from "../src/cost";
+import { cacheSplit, priceFor, turnCost } from "../src/cost";
 import pricing from "../pricing.json" with { type: "json" };
 
 const id = process.argv[2];
@@ -67,15 +67,14 @@ const input = u.input_tokens ?? 0;
 const cc = u.cache_creation_input_tokens ?? 0;
 const cr = u.cache_read_input_tokens ?? 0;
 const out = u.output_tokens ?? 0;
-const split = u.cache_creation ?? {};
-const w5 = split.ephemeral_5m_input_tokens ?? cc;
-const w1 = split.ephemeral_1h_input_tokens ?? 0;
+const { w5, w1 } = cacheSplit(u);
 let rIn = p.in;
 let rOut = p.out;
 let rCr = p.cacheRead;
 if (u.speed === "fast" && p.fast) {
   rIn = p.fast.in;
   rOut = p.fast.out;
+  rCr = p.fast.in * (p.cacheRead / p.in); // cache read keeps the standard cache-read/input ratio
 }
 if (p.longPrompt && input + cc + cr > p.longPrompt.over) {
   rIn = p.longPrompt.in;

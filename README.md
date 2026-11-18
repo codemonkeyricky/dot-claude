@@ -1,8 +1,8 @@
 # dot-claude
 
-An orchestration harness for Claude Code. The main session plans a task DAG and dispatches the implementation work to cheap Haiku "executor" subagents, while hooks enforce that split. The harness lives under `.claude/` and holds only the shareable config: workflow rules, hooks, agent definitions, generator scripts and the hook registrations in `.claude/settings.json`. The repo also carries a `tools/` directory with standalone tools (see Tools below).
+An orchestration harness for Claude Code. The main session plans a task DAG and dispatches the implementation work to cheap Haiku "executor" subagents, while hooks enforce that split. The harness lives under `.claude/` and holds only the shareable config: workflow rules, hooks, agent definitions, generator scripts and the hook registrations in `.claude/settings.harness.json`. The repo also carries a `tools/` directory with standalone tools (see Tools below).
 
-> **Note:** because the harness now sits in `.claude/`, opening Claude Code inside this repo also loads it as project config (`.claude/CLAUDE.md` and `.claude/settings.json`). The hook commands in `settings.json` point at `~/.claude/hooks/`, so they run the installed copy, not the repo copy.
+> **Note:** because the harness sits in `.claude/`, opening Claude Code inside this repo still loads `.claude/CLAUDE.md` and `.claude/agents/` as project config. These are harmless duplicates of the installed copies. Hooks come only from the installed `~/.claude/settings.json`, never from this repo: the repo file is named `.claude/settings.harness.json` so Claude Code does not read it as project settings, and it takes effect only after `./deploy.sh` merges it into `~/.claude/settings.json`.
 
 ## How it works
 
@@ -26,7 +26,7 @@ An orchestration harness for Claude Code. The main session plans a task DAG and 
 | `.claude/hooks/result-capture.py` | Stop. Appends each `result:` line of the final message to `hooks/state/completed-work.jsonl` (under the installed `~/.claude`). |
 | `.claude/hooks/session-repo.py` | Titles each session `[repo] branch` followed by its title, and buckets sessions by repo. |
 | `.claude/hooks/sessions-by-repo.py` | Report CLI over those per-repo session buckets. |
-| `.claude/settings.json` | Hook registrations, `CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-5-5`, and Haiku effort `medium`. |
+| `.claude/settings.harness.json` | Hook registrations, `CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-5-5`, and Haiku effort `medium`. Merged into the installed `settings.json` by `deploy.sh`. |
 | `.claude/scripts/` | Executor and reviewer templates, plus `gen_executors.py` (`--check` reports stale agent files). |
 | `deploy.sh` | Installer (repo root). Installs the contents of `.claude/` into `~/.claude`, described below. |
 | `tools/session-plot/` | Session plot tool: main and subagent context/fork timeline from a session jsonl. |
@@ -64,7 +64,7 @@ Install:
 ./deploy.sh
 ```
 
-`deploy.sh` copies the tracked files under `.claude/` into `~/.claude` (or `CLAUDE_DIR`, if set), so `.claude/hooks/x.py` installs to `~/.claude/hooks/x.py`. Nothing outside `.claude/` is installed, and it never deletes anything there. `settings.json` is deep-merged rather than copied: keys from this repo win, and any other settings already in the target (permissions, theme, plugins, personal model choices) are kept. Dicts merge recursively; lists are replaced wholesale. So a list the repo sets (for example each `hooks.<Event>` array) replaces the target's list for that key, and any hook registered only in the target under the same event is dropped. Keys removed from this repo are not removed from the target; delete them there by hand. The merge runs before any file is copied, so an invalid `settings.json` (in the target or the repo) stops the install with an error and changes nothing.
+`deploy.sh` copies the tracked files under `.claude/` into `~/.claude` (or `CLAUDE_DIR`, if set; a relative `CLAUDE_DIR` is taken from the directory you run the script in), so `.claude/hooks/x.py` installs to `~/.claude/hooks/x.py`. Nothing outside `.claude/` is installed, and it never deletes anything there. `.claude/settings.harness.json` is never copied as a file: it is deep-merged into the target's `settings.json`. Keys from this repo win, and any other settings already in the target (permissions, theme, plugins, personal model choices) are kept. Dicts merge recursively; lists are replaced wholesale. So a list the repo sets (for example each `hooks.<Event>` array) replaces the target's list for that key, and any hook registered only in the target under the same event is dropped. Keys removed from this repo are not removed from the target; delete them there by hand. The merge runs before any file is copied, so an invalid `settings.json` (in the target) or `settings.harness.json` (in the repo) stops the install with an error and changes nothing.
 
 After editing `.claude/scripts/executor-template.md` or `.claude/scripts/opus-reviewer.md`, run `python3 .claude/scripts/gen_executors.py --root .claude` in the repo to regenerate `.claude/agents/`, then `./deploy.sh`.
 

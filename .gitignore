@@ -9,7 +9,7 @@
 # Inside .claude/: ignore everything, then un-ignore the shareable harness config only
 /.claude/*
 !/.claude/CLAUDE.md
-!/.claude/settings.json
+!/.claude/settings.harness.json
 !/.claude/keybindings.json
 !/.claude/agents/
 !/.claude/hooks/

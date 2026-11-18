@@ -77,7 +77,7 @@ def render_reviewer(source_name, fm, body, slug, full):
     out = []
     for line in fm:
         if line.startswith("# "):
-            out.append("# GENERATED from %s by python3 scripts/gen_executors.py --root . "
+            out.append("# GENERATED from %s by python3 .claude/scripts/gen_executors.py --root .claude "
                        "(from the repo root) - do not edit by hand" % source_name)
         elif line.startswith("name:"):
             out.append("name: " + slug)

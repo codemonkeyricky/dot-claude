@@ -43,7 +43,10 @@ at most once per second.
 Each assistant turn is priced at the API list price for its model, using the rates in
 `pricing.json` at the repo root. Cache writes are priced at 1.25x input (5 min) or 2x
 input (1 h), cache reads at the model's cache-read rate, and fast-mode turns use the fast
-rates. Haiku uses its long-prompt rates above 100k prompt tokens.
+rates. In a fast-mode turn the cache read and write multipliers apply to the fast rates:
+cache reads cost the fast input rate times the model's cache-read/input ratio, and cache
+writes cost 1.25x (5 min) or 2x (1 h) the fast input rate. Haiku uses its long-prompt rates
+above 100k prompt tokens.
 
 **This is the API-equivalent list price, not subscription billing.** A Claude subscription
 does not charge per token, so the numbers show what the same usage would cost through the
@@ -70,9 +73,15 @@ not included.
 
 ## Other scripts
 
-- `npm run typecheck`: `tsc --noEmit` over `src/`, `server.ts`, `export.ts`, `scripts/`.
+- `npm run typecheck`: `tsc --noEmit` over `src/`, `server.ts`, `export.ts`, `scripts/`, `test/`.
 - `npm run check -- <sessionId>`: prints summary numbers for the given session, cost
   totals per model, and a hand-computed cost for one turn.
+- `npm test`: unit tests (`node:test`) for cost, live index, transcript assembly and the
+  Host check. They use temp directories and make no changes under `~/.claude`.
+
+The server listens on `127.0.0.1` at port 4395, or at `PORT` when set. It answers only
+requests whose `Host` header is `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`
+(DNS-rebinding guard); other hosts get 403.
 
 ## Layout
 

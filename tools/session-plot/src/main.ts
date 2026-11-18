@@ -86,14 +86,21 @@ function niceStep(span: number, maxTicks: number, steps: number[]): number {
   return steps[steps.length - 1];
 }
 
-// Local-time ticks on whole minutes, aligned to multiples of the step (minutes of day).
+const TICK_STEPS_MIN = [5, 10, 15, 30, 60, 120, 180, 240, 360, 720, 1440, 2880, 4320, 10080, 20160, 43200];
+const MAX_TICKS = 24;
+
+// Local-time ticks on whole minutes, on a grid of multiples of the step counted from local
+// midnight. The step is chosen so there are about 12 ticks and never more than MAX_TICKS.
 function timeTicks(tmin: number, tmax: number): number[] {
-  const spanMin = (tmax - tmin) / 60000;
-  const stepMin = niceStep(spanMin, 12, [5, 10, 15, 30, 60, 120, 180, 240, 360, 720]);
+  if (!Number.isFinite(tmin) || !Number.isFinite(tmax) || tmax < tmin) return [];
+  const stepMs = niceStep((tmax - tmin) / 60000, 12, TICK_STEPS_MIN) * 60000;
+  const origin = new Date(tmin);
+  origin.setHours(0, 0, 0, 0);
+  const grid0 = origin.getTime();
   const ticks: number[] = [];
-  for (let t = Math.ceil(tmin / 60000) * 60000; t <= tmax; t += 60000) {
-    const d = new Date(t);
-    if ((d.getHours() * 60 + d.getMinutes()) % stepMin === 0) ticks.push(t);
+  // Hard cap: the loop ends at tmax or after MAX_TICKS ticks, whatever the range.
+  for (let t = grid0 + Math.ceil((tmin - grid0) / stepMs) * stepMs; t <= tmax && ticks.length < MAX_TICKS; t += stepMs) {
+    ticks.push(t);
   }
   return ticks;
 }
@@ -140,8 +147,15 @@ function renderChart(d: SessionData): void {
   const subs = d.subagents;
   const all: Series[] = [d.main, ...subs];
 
-  const tmin = Math.min(...all.map((s) => s.start));
-  let tmax = Math.max(...all.map((s) => s.end));
+  // Only finite, positive times define the axis: a missing time must not pull it to 1970.
+  const isTime = (t: number): boolean => Number.isFinite(t) && t > 0;
+  const starts = all.map((s) => s.start).filter(isTime);
+  if (starts.length === 0) {
+    box.innerHTML = "";
+    return;
+  }
+  const tmin = Math.min(...starts);
+  let tmax = Math.max(tmin, ...all.map((s) => s.end).filter(isTime));
   if (tmax - tmin < 60000) tmax = tmin + 60000;
   const X = (t: number): number => LEFT + ((t - tmin) / (tmax - tmin)) * plotW;
 
@@ -430,7 +444,11 @@ async function getJson<T>(url: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+// Each selection gets a token; a response for an earlier selection is discarded when it arrives late.
+let selectToken = 0;
+
 async function selectSession(id: string): Promise<void> {
+  const token = ++selectToken;
   try {
     const u = new URL(location.href);
     u.searchParams.set("session", id);
@@ -441,9 +459,9 @@ async function selectSession(id: string): Promise<void> {
   setStatus("Loading…");
   try {
     const d = await getJson<SessionData>(`/api/session/${encodeURIComponent(id)}`);
-    renderSession(d);
+    if (token === selectToken) renderSession(d);
   } catch (e) {
-    setStatus(`Failed to load ${id}: ${(e as Error).message}`);
+    if (token === selectToken) setStatus(`Failed to load ${id}: ${(e as Error).message}`);
   }
 }
 

@@ -47,6 +47,16 @@ interface Transcript {
   lastTs?: number;
   compactTs: number[];
   toolUseTs: Map<string, number>;
+  customTitle?: string; // last custom-title record in the whole transcript
+}
+
+// One subagent transcript and its sidecar files, as read from disk (or built in tests).
+export interface SubagentInput {
+  agentId: string;
+  lines: string[];
+  meta: Obj | null;
+  forked: Obj | null;
+  forkedExists: boolean;
 }
 
 export interface ParseStats {
@@ -129,7 +139,11 @@ function titleFrom(lines: string[]): string {
     const o = parseLine(line);
     if (o) objs.push(o);
   }
-  const custom = objs.find((o) => o.type === "custom-title" && typeof o.customTitle === "string" && o.customTitle.trim());
+  // The last custom-title record wins (a rename appends a new record).
+  let custom: Obj | undefined;
+  for (const o of objs) {
+    if (o.type === "custom-title" && typeof o.customTitle === "string" && o.customTitle.trim()) custom = o;
+  }
   if (custom) return String(custom.customTitle).trim();
   const summary = objs.find((o) => o.type === "summary" && typeof o.summary === "string" && o.summary.trim());
   if (summary) return String(summary.summary).trim();
@@ -206,6 +220,7 @@ function parseTranscript(lines: string[]): Transcript {
   const toolUseTs = new Map<string, number>();
   let firstTs: number | undefined;
   let lastTs: number | undefined;
+  let customTitle: string | undefined;
 
   lines.forEach((line, index) => {
     const o = parseLine(line);
@@ -218,6 +233,9 @@ function parseTranscript(lines: string[]): Transcript {
     }
     if ((o.subtype === "compact_boundary" || o.isCompactSummary === true) && hasTs) {
       compactTs.push(ts);
+    }
+    if (o.type === "custom-title" && typeof o.customTitle === "string" && o.customTitle.trim()) {
+      customTitle = o.customTitle.trim();
     }
     const msg = o.message;
     if (o.type !== "assistant" || !msg || typeof msg !== "object" || !hasTs) return;
@@ -259,7 +277,7 @@ function parseTranscript(lines: string[]): Transcript {
     });
   }
   turns.sort((a, b) => a.t - b.t);
-  return { turns, firstTs, lastTs, compactTs, toolUseTs };
+  return { turns, firstTs, lastTs, compactTs, toolUseTs, customTitle };
 }
 
 // Merge compaction markers within 120 s of each other into one event (earliest timestamp).
@@ -354,9 +372,33 @@ export function parseSessionDetailed(id: string): ParseResult {
   const found = findSessionFile(id);
   if (!found) throw new SessionNotFoundError(id);
 
-  const lines = readLines(found.file);
-  const main = parseTranscript(lines);
-  const title = titleFrom(lines);
+  const mainLines = readLines(found.file);
+  const subDir = join(PROJECTS_DIR, found.projectDir, id, "subagents");
+  const subInputs: SubagentInput[] = [];
+  if (existsSync(subDir)) {
+    for (const name of readdirSync(subDir).sort()) {
+      const m = /^agent-(.+)\.jsonl$/.exec(name);
+      if (!m) continue;
+      const agentId = m[1];
+      const base = join(subDir, `agent-${agentId}`);
+      const forkedPath = `${base}.forked-skill.json`;
+      const forkedExists = existsSync(forkedPath);
+      subInputs.push({
+        agentId,
+        lines: readLines(join(subDir, name)),
+        meta: readJsonFile(`${base}.meta.json`),
+        forked: forkedExists ? readJsonFile(forkedPath) : null,
+        forkedExists,
+      });
+    }
+  }
+  return assembleSession(id, mainLines, subInputs);
+}
+
+// Builds the session data from already-read transcript lines. Pure: no file access.
+export function assembleSession(id: string, mainLines: string[], subInputs: SubagentInput[]): ParseResult {
+  const main = parseTranscript(mainLines);
+  const title = main.customTitle ?? titleFrom(mainLines);
 
   const mainSeries = buildSeries({
     id: "main",
@@ -367,45 +409,40 @@ export function parseSessionDetailed(id: string): ParseResult {
     turns: main.turns,
   });
 
-  const subDir = join(PROJECTS_DIR, found.projectDir, id, "subagents");
   const subagents: Series[] = [];
   const subTurns: Turn[][] = [];
   let spawnFromToolUse = 0;
   let spawnFallback = 0;
 
-  if (existsSync(subDir)) {
-    for (const name of readdirSync(subDir).sort()) {
-      const m = /^agent-(.+)\.jsonl$/.exec(name);
-      if (!m) continue;
-      const agentId = m[1];
-      const base = join(subDir, `agent-${agentId}`);
-      const meta = readJsonFile(`${base}.meta.json`);
-      const forkedPath = `${base}.forked-skill.json`;
-      const forkedExists = existsSync(forkedPath);
-      const forked = forkedExists ? readJsonFile(forkedPath) : null;
-      const sub = parseTranscript(readLines(join(subDir, name)));
+  for (const input of subInputs) {
+    const { agentId, meta, forked, forkedExists } = input;
+    const sub = parseTranscript(input.lines);
 
-      const agentType = agentTypeOf(meta);
-      const kind = classify(agentType, forkedExists);
-      const label = subagentLabel(agentId, meta, forked, forkedExists);
+    const agentType = agentTypeOf(meta);
+    const kind = classify(agentType, forkedExists);
+    const label = subagentLabel(agentId, meta, forked, forkedExists);
 
-      let spawn: number | undefined;
-      const toolUseId = typeof meta?.toolUseId === "string" ? meta.toolUseId : undefined;
-      if (toolUseId !== undefined && main.toolUseTs.has(toolUseId)) {
-        spawn = main.toolUseTs.get(toolUseId);
-        spawnFromToolUse++;
-      } else {
-        spawn = sub.firstTs;
-        spawnFallback++;
-      }
-
-      const start = spawn ?? sub.firstTs ?? 0;
-      const end = Math.max(start, sub.lastTs ?? start);
-      subagents.push(
-        buildSeries({ id: agentId, label, kind, agentType, spawn, start, end, turns: sub.turns }),
-      );
-      subTurns.push(sub.turns);
+    let spawn: number | undefined;
+    const toolUseId = typeof meta?.toolUseId === "string" ? meta.toolUseId : undefined;
+    const fromToolUse = toolUseId !== undefined ? main.toolUseTs.get(toolUseId) : undefined;
+    if (fromToolUse !== undefined) {
+      spawn = fromToolUse;
+      spawnFromToolUse++;
+    } else {
+      spawn = sub.firstTs;
+      spawnFallback++;
     }
+
+    // Never start at 0: without any time of its own, a subagent starts at the parent's last
+    // timestamp (never before the parent's first one). With no time anywhere it is left off the
+    // time axis entirely.
+    const start = spawn ?? main.lastTs;
+    if (start === undefined || !Number.isFinite(start) || start <= 0) continue;
+    const end = Math.max(start, sub.lastTs ?? start);
+    subagents.push(
+      buildSeries({ id: agentId, label, kind, agentType, spawn, start, end, turns: sub.turns }),
+    );
+    subTurns.push(sub.turns);
   }
 
   subagents.sort((a, b) => (a.spawn ?? a.start) - (b.spawn ?? b.start));

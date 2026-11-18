@@ -5,10 +5,12 @@ import { fileURLToPath } from "node:url";
 import { listSessions, parseSession, SessionNotFoundError } from "./src/parse";
 import { bundleClient, bundleLive } from "./src/bundle";
 import { LiveIndex, type LiveUpdate } from "./src/live";
+import { isAllowedHost } from "./src/host";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const HOST = "127.0.0.1";
-const PORT = 4395;
+const envPort = Number(process.env.PORT);
+const PORT = Number.isInteger(envPort) && envPort > 0 && envPort < 65536 ? envPort : 4395;
 
 // One index for the process; it watches ~/.claude/projects and keeps itself current.
 const live = new LiveIndex();
@@ -58,6 +60,10 @@ function streamLive(req: IncomingMessage, res: ServerResponse): void {
 
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   try {
+    // DNS rebinding: refuse any Host that is not the loopback address on our port, before routing.
+    if (!isAllowedHost(req.headers.host, PORT)) {
+      return send(res, 403, "forbidden: bad host\n", "text/plain; charset=utf-8");
+    }
     if (req.method !== "GET" && req.method !== "HEAD") {
       return send(res, 405, "method not allowed", "text/plain; charset=utf-8");
     }
@@ -100,7 +106,11 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     }
 
     if (path === "/live.js") {
-      liveJs ??= bundleLive(false);
+      // Cache the bundle, but drop a failed attempt so the next request retries the build.
+      liveJs ??= bundleLive(false).catch((err: unknown) => {
+        liveJs = null;
+        throw err;
+      });
       return send(res, 200, await liveJs, "text/javascript; charset=utf-8");
     }
 
