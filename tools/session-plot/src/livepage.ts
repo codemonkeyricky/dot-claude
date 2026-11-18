@@ -25,6 +25,10 @@ let cardMode: Map<string, CardMode> = loadCardModes();
 // Rendered card node and the HTML it was built from, per session id (see renderCards).
 const cardEls = new Map<string, HTMLElement>();
 const cardHtmls = new Map<string, string>();
+// The card under a press: from pointerdown on one of its toggle buttons until release. Its DOM is kept
+// during the press, so the click that ends the press reaches the same button.
+let held: { id: string; timer: ReturnType<typeof setTimeout> } | null = null;
+const HOLD_MS = 2000;
 
 function $<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -333,7 +337,7 @@ function parseCard(html: string): HTMLElement {
 }
 
 // Only a card whose HTML changed is replaced, so a click or keyboard focus on an unchanged card
-// survives the snapshot. Nodes are moved to match the snapshot order, and gone sessions are removed.
+// survives the snapshot. A card under a press (see held) is not replaced until the press ends. Nodes are moved to match the snapshot order, and gone sessions are removed.
 function renderCards(s: LiveSnapshot): void {
   const grid = $<HTMLElement>("cards");
   if (s.sessions.length === 0) {
@@ -357,7 +361,8 @@ function renderCards(s: LiveSnapshot): void {
     if (!el) {
       el = parseCard(html);
       cardEls.set(x.id, el);
-    } else if (cardHtmls.get(x.id) !== html) {
+      cardHtmls.set(x.id, html);
+    } else if (cardHtmls.get(x.id) !== html && held?.id !== x.id) {
       const active = document.activeElement as HTMLElement | null;
       const focusMode = active && el.contains(active) && active.tagName === "BUTTON" ? active.dataset.mode : undefined;
       if (isCardMode(focusMode)) refocus = { id: x.id, mode: focusMode };
@@ -365,8 +370,10 @@ function renderCards(s: LiveSnapshot): void {
       el.replaceWith(fresh);
       el = fresh;
       cardEls.set(x.id, el);
+      // Recorded only for the DOM that was built: a held card keeps its old html here, so the
+      // release re-render sees the difference.
+      cardHtmls.set(x.id, html);
     }
-    cardHtmls.set(x.id, html);
     const at = grid.children[idx];
     if (at !== el) grid.insertBefore(el, at ?? null);
   });
@@ -546,17 +553,39 @@ function modeButtonOf(e: Event): { id: string; mode: CardMode } | null {
 }
 
 const cardsEl = $<HTMLElement>("cards");
-// Mouse, touch and pen act on pointerdown, before any re-render can swallow the mouseup.
+
+// Ends the press: drops the hold and applies any newer HTML. The re-render runs as a macrotask so
+// the click that follows pointerup is dispatched to the button before it is replaced.
+function releaseHold(): void {
+  if (!held) return;
+  clearTimeout(held.timer);
+  held = null;
+  document.removeEventListener("pointerup", releaseHold);
+  document.removeEventListener("pointercancel", releaseHold);
+  document.removeEventListener("lostpointercapture", releaseHold);
+  setTimeout(() => {
+    if (snap) renderCards(snap);
+  }, 0);
+}
+
+// A press on a toggle holds its card. Touch scrolling starts a pointercancel, which ends the press
+// with no click. Releasing outside the button also ends it, and the click then lands on the cards
+// container, so no toggle happens. Nothing here calls preventDefault, so scrolling still works.
 cardsEl.addEventListener("pointerdown", (e) => {
   if (e.pointerType === "mouse" && e.button !== 0) return;
   const hit = modeButtonOf(e);
-  if (hit) setCardMode(hit.id, hit.mode, false);
+  if (!hit) return;
+  if (held) releaseHold();
+  held = { id: hit.id, timer: setTimeout(releaseHold, HOLD_MS) };
+  document.addEventListener("pointerup", releaseHold);
+  document.addEventListener("pointercancel", releaseHold);
+  document.addEventListener("lostpointercapture", releaseHold);
 });
-// Keyboard activation fires click with detail 0. Pointer clicks (detail >= 1) were handled above.
+// The only action. Mouse, touch tap, and keyboard Enter or Space all end in click. Keyboard
+// activation has detail 0 and keeps the focus restore.
 cardsEl.addEventListener("click", (e) => {
-  if (e.detail !== 0) return;
   const hit = modeButtonOf(e);
-  if (hit) setCardMode(hit.id, hit.mode, true);
+  if (hit) setCardMode(hit.id, hit.mode, e.detail === 0);
 });
 
 setInterval(tick, 1000);
