@@ -15,6 +15,12 @@ class T(unittest.TestCase):
         self.state = os.path.join(self.root, "state")
         self.log = os.path.join(self.root, "task-gate.log")
         self.clog = os.path.join(self.root, "completed-work.jsonl")
+        self.agents = os.path.join(self.root, "agents")
+        os.makedirs(self.agents)
+        for name, model in [("X", "haiku"), ("Y", "haiku"), ("qorvax-tel", "haiku"), ("zyrene-vosk", "haiku"),
+                            ("kreeva-osh", "haiku"), ("opus-custom", "opus")]:
+            with open(os.path.join(self.agents, name + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\nname: %s\nmodel: %s\n---\nbody\n" % (name, model))
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -27,12 +33,13 @@ class T(unittest.TestCase):
         e["TASK_GATE_STATE_DIR"] = self.state
         e["TASK_GATE_LOG"] = self.log
         e["TASK_GATE_COMPLETION_LOG"] = self.clog
+        e["TASK_GATE_AGENTS_DIR"] = self.agents
         e.update(env or {})
         r = subprocess.run([sys.executable, "-I", HOOK], input=raw, capture_output=True, text=True, env=e)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
-    def pre(self, subagent="general-purpose", sid="sA", tool="Agent", agent_id=None, env=None, omit_subagent=False, ti_extra=None, tuid="toolu_x"):
+    def pre(self, subagent="X", sid="sA", tool="Agent", agent_id=None, env=None, omit_subagent=False, ti_extra=None, tuid="toolu_x"):
         ti = {"description": "d", "prompt": "p", "run_in_background": False}
         if not omit_subagent:
             ti["subagent_type"] = subagent
@@ -73,19 +80,19 @@ class T(unittest.TestCase):
 
     # 1
     def test_01_no_tasks_denied_with_shape_and_log(self):
-        r = self.pre("general-purpose")
+        r = self.pre("X")
         out = json.loads(r.stdout)
         hso = out["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "PreToolUse")
         self.assertEqual(hso["permissionDecision"], "deny")
-        self.assertIn('No in_progress task owned by "general-purpose"', hso["permissionDecisionReason"])
+        self.assertIn('No in_progress task owned by "X"', hso["permissionDecisionReason"])
         self.assertIn("DENY", self.log_text())
-        self.assertIn("subagent=general-purpose", self.log_text())
+        self.assertIn("subagent=X", self.log_text())
 
     # 2
     def test_02_pending_task_denied(self):
         self.create(1)
-        self.assertEqual(decision(self.pre("general-purpose")), "deny")
+        self.assertEqual(decision(self.pre("X")), "deny")
 
     # 3
     def test_03_in_progress_owner_allowed_only_for_owner(self):
@@ -117,8 +124,10 @@ class T(unittest.TestCase):
     # 7
     def test_07_missing_subagent_type_defaults_to_general_purpose(self):
         self.create(1)
-        self.update(1, status="in_progress", owner="general-purpose")
-        self.assertEqual(decision(self.pre(omit_subagent=True)), "allow")
+        self.update(1, status="in_progress", owner="X")
+        r = self.pre(omit_subagent=True)
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("is not allowed from the main session", json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_07b_missing_subagent_type_denied_for_other_owner(self):
         self.create(1)
@@ -134,7 +143,7 @@ class T(unittest.TestCase):
 
     # 9
     def test_09_subagent_payload_unrestricted(self):
-        self.assertEqual(decision(self.pre("general-purpose", agent_id="agent-123")), "allow")
+        self.assertEqual(decision(self.pre("X", agent_id="agent-123")), "allow")
 
     # 10
     def _exempt_cfg(self):
@@ -146,20 +155,20 @@ class T(unittest.TestCase):
     def test_10_exempt_env_roles_exempt(self):
         cfg = self._exempt_cfg()
         for role in ["bot", "bot-minion"]:
-            self.assertEqual(decision(self.pre("general-purpose", env=dict(cfg, HARNESS_TEST_ROLE=role))), "allow", role)
+            self.assertEqual(decision(self.pre("X", env=dict(cfg, HARNESS_TEST_ROLE=role))), "allow", role)
 
     def test_10b_other_roles_denied(self):
         cfg = self._exempt_cfg()
         for role in ["Bot-minion", "xbot-minion", "bots", ""]:
-            self.assertEqual(decision(self.pre("general-purpose", env=dict(cfg, HARNESS_TEST_ROLE=role))), "deny", repr(role))
-        self.assertEqual(decision(self.pre("general-purpose", env=cfg)), "deny", "unset")
+            self.assertEqual(decision(self.pre("X", env=dict(cfg, HARNESS_TEST_ROLE=role))), "deny", repr(role))
+        self.assertEqual(decision(self.pre("X", env=cfg)), "deny", "unset")
 
     def test_10c_no_config_no_exemption(self):
-        self.assertEqual(decision(self.pre("general-purpose", env={"HARNESS_TEST_ROLE": "bot"})), "deny")
+        self.assertEqual(decision(self.pre("X", env={"HARNESS_TEST_ROLE": "bot"})), "deny")
 
     # 11
     def test_11_main_write_exempt(self):
-        self.assertEqual(decision(self.pre("general-purpose", env={"CLAUDE_MAIN_WRITE": "1"})), "allow")
+        self.assertEqual(decision(self.pre("X", env={"CLAUDE_MAIN_WRITE": "1"})), "allow")
 
     # 12
     def test_12_garbage_and_empty_stdin_fail_open(self):
@@ -175,7 +184,7 @@ class T(unittest.TestCase):
 
     # 14
     def test_14_task_tool_gated(self):
-        self.assertEqual(decision(self.pre("general-purpose", tool="Task")), "deny")
+        self.assertEqual(decision(self.pre("X", tool="Task")), "deny")
 
     # 15
     def test_15_stale_state_removed_fresh_kept(self):
@@ -208,7 +217,7 @@ class T(unittest.TestCase):
             p["agent_id"] = agent_id
         return self._run(json.dumps(p), env)
 
-    def post_agent(self, subagent="general-purpose", sid="sA"):
+    def post_agent(self, subagent="X", sid="sA"):
         return self.post("Agent", {"description": "d", "prompt": "p", "subagent_type": subagent},
                          {}, sid)
 
@@ -332,7 +341,7 @@ class T(unittest.TestCase):
 
     # 26
     def test_26_require_task_kill_switch_allows_agent(self):
-        self.assertEqual(self.pre("general-purpose", env={"CLAUDE_REQUIRE_TASK": "0"}).stdout, "")
+        self.assertEqual(self.pre("X", env={"CLAUDE_REQUIRE_TASK": "0"}).stdout, "")
 
     # 27
     def test_27_require_task_kill_switch_still_records(self):
@@ -682,6 +691,162 @@ class SendMessageTracking(T):
         r = self.pre("zyrene-vosk", ti_extra={"description": "task #3"}, tuid="toolu_B")
         self.assertEqual(decision(r), "deny")
         self.assertEqual(self.sA_state()["3"]["owner"], "qorvax-tel")
+
+
+class ModelGate(unittest.TestCase):
+    """Model gate for Agent|Task from the main session: executors run on Haiku; a non-Haiku model needs
+    proven escalation (a prior Haiku round, metadata.escalate_reason, and a model in model_gate.escalate_to).
+    Borrows T's harness helpers without inheriting its test methods (no duplicate runs)."""
+    setUp = T.setUp
+    tearDown = T.tearDown
+    _run = T._run
+    pre = T.pre
+    post = T.post
+    create = T.create
+    update = T.update
+    clog_lines = T.clog_lines
+    log_text = T.log_text
+    sA_state = T.sA_state
+
+    def write_cfg(self, obj, name="harness.json"):
+        path = os.path.join(self.root, name)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        return {"CLAUDE_HARNESS_CONFIG": path}
+
+    def mg(self, model=None, sub="X", task=1, sid="sA", effort=None, env=None):
+        ti = {"description": "task #%d" % task} if task else {}
+        if model is not None:
+            ti["model"] = model
+        if effort is not None:
+            ti["effort"] = effort
+        return self.pre(sub, sid=sid, ti_extra=ti, env=env)
+
+    def reason(self, r):
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def rounds(self, tid="1", sid="sA"):
+        return self.sA_state(sid)[tid]["rounds"]
+
+    def test_mg01_executor_model_omitted_allowed_and_round_recorded(self):
+        self.create(1)
+        self.assertEqual(decision(self.mg()), "allow")
+        st = self.sA_state()["1"]
+        self.assertEqual(st["owner"], "X")
+        self.assertTrue(st["dispatched"])
+        self.assertEqual([r["model"] for r in st["rounds"]], ["haiku"])
+        self.assertIsNone(st["rounds"][0]["effort"])
+        self.assertTrue(st["rounds"][0]["ts"].endswith("Z"))
+
+    def test_mg02_executor_haiku_models_allowed(self):
+        self.create(1)
+        self.assertEqual(decision(self.mg(model="haiku")), "allow")
+        self.create(1, sid="sB")
+        self.assertEqual(decision(self.mg(model="claude-haiku-5-5", sid="sB")), "allow")
+        self.assertEqual(self.rounds("1")[0]["model"], "haiku")
+        self.assertEqual(self.rounds("1", sid="sB")[0]["model"], "claude-haiku-5-5")
+
+    def test_mg03_opus_first_round_denied_and_nothing_claimed(self):
+        self.create(1)
+        r = self.mg(model="opus")
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("no earlier Haiku round", self.reason(r))
+        self.assertIn("model-gate=escalation", self.log_text())
+        st = self.sA_state()["1"]
+        self.assertEqual(st["status"], "pending")
+        self.assertFalse(st["dispatched"])
+        self.assertEqual(st["rounds"], [])
+        self.assertEqual(self.clog_lines(), [])
+
+    def test_mg04_opus_with_prior_round_but_no_reason_denied(self):
+        self.create(1)
+        self.assertEqual(decision(self.mg()), "allow")
+        r = self.mg(model="opus")
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("no escalate_reason", self.reason(r))
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertEqual(self.clog_lines(), [])
+
+    def test_mg05_escalation_with_prior_round_and_reason_allowed_and_logged(self):
+        self.create(1)
+        self.assertEqual(decision(self.mg()), "allow")
+        self.update(1, metadata={"escalate_reason": "acceptance check 3 failed: tests red"})
+        self.assertEqual(decision(self.mg(model="opus", effort="high")), "allow")
+        self.assertEqual([r["model"] for r in self.rounds()], ["haiku", "opus"])
+        self.assertEqual(self.rounds()[1]["effort"], "high")
+        lines = self.clog_lines()
+        self.assertEqual(len(lines), 1)
+        rec = lines[0]
+        self.assertEqual(rec["kind"], "escalation")
+        self.assertEqual(rec["task_id"], "1")
+        self.assertEqual(rec["subagent"], "X")
+        self.assertEqual(rec["model"], "opus")
+        self.assertEqual(rec["effort"], "high")
+        self.assertEqual(rec["escalate_reason"], "acceptance check 3 failed: tests red")
+        self.assertEqual(rec["session_id"], "sA")
+
+    def test_mg06_escalate_to_default_is_opus_only(self):
+        self.create(1)
+        self.assertEqual(decision(self.mg()), "allow")
+        self.update(1, metadata={"escalate_reason": "check failed"})
+        r = self.mg(model="sonnet")
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("not in model_gate.escalate_to", self.reason(r))
+        self.assertEqual(self.clog_lines(), [])
+        self.assertEqual(len(self.rounds()), 1)
+        cfg = self.write_cfg({"model_gate": {"escalate_to": ["opus", "sonnet"]}})
+        self.assertEqual(decision(self.mg(model="sonnet", env=cfg)), "allow")
+        self.assertEqual(decision(self.mg(model="claude-opus-5-5", env=cfg)), "allow")
+
+    def test_mg07_non_executor_types_denied_from_main(self):
+        self.create(1)
+        for sub in ["general-purpose", "fork", "claude", "statusline-setup", "Plan", "no-such-agent"]:
+            r = self.pre(sub, ti_extra={"description": "task #1"})
+            self.assertEqual(decision(r), "deny", sub)
+            self.assertIn("is not allowed from the main session", self.reason(r), sub)
+        r = self.pre(omit_subagent=True)
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("is not allowed", self.reason(r))
+        self.assertIn("model-gate=type", self.log_text())
+        self.assertEqual(self.sA_state()["1"]["status"], "pending")
+
+    def test_mg08_explore_and_helper_types_still_exempt(self):
+        for sub in ["Explore", "web-fetch", "claude-code-guide"]:
+            self.assertEqual(decision(self.pre(sub)), "allow", sub)
+
+    def test_mg09_custom_agent_needs_allow_types(self):
+        self.create(1)
+        r = self.mg(sub="opus-custom")
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("is not allowed from the main session", self.reason(r))
+        cfg = self.write_cfg({"model_gate": {"allow_types": ["opus-custom"]}})
+        self.assertEqual(decision(self.mg(sub="opus-custom", env=cfg)), "allow")
+        self.assertEqual(self.rounds()[0]["model"], "haiku")
+
+    def test_mg10_unsafe_names_never_read(self):
+        with open(os.path.join(self.root, "evil.md"), "w", encoding="utf-8") as f:
+            f.write("---\nmodel: haiku\n---\n")
+        self.create(1)
+        for sub in ["../evil", "a/b", ".hidden"]:
+            r = self.pre(sub, ti_extra={"description": "task #1"})
+            self.assertEqual(decision(r), "deny", sub)
+            self.assertIn("is not allowed", self.reason(r), sub)
+
+    def test_mg11_old_state_without_rounds_loads(self):
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "sA.json"), "w", encoding="utf-8") as f:
+            json.dump({"1": {"subject": "old", "status": "in_progress", "owner": "X"}}, f)
+        self.assertEqual(decision(self.mg(task=None)), "allow")
+        self.assertEqual([r["model"] for r in self.rounds()], ["haiku"])
+
+    def test_mg12_completed_task_cannot_be_escalated(self):
+        self.create(1)
+        self.assertEqual(decision(self.mg()), "allow")
+        self.update(1, status="completed")
+        self.update(1, metadata={"escalate_reason": "late"})
+        r = self.mg(model="opus")
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("already completed", self.reason(r))
 
 
 if __name__ == "__main__":
