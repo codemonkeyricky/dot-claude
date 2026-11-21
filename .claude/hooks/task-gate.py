@@ -30,12 +30,21 @@ Gates (PreToolUse, main agent only):
                 dispatched.
                 Otherwise allowed only if an in_progress task owned by the subagent has no open
                 blocker. On allow, dispatched=True on all its in_progress tasks.
+                Auto-claim (one Agent call is enough): when no in_progress task owned by the
+                subagent is unblocked and it owns no in_progress task at all, the task the call
+                names (first '#<n>' in description, else first in prompt) is claimed if ready
+                (pending, no owner, no open blocker, metadata.dispatch not False): status
+                in_progress, owner=subagent, dispatched=True, metadata.auto_claimed=True. The
+                call is then allowed. A named task that is not ready keeps the denial, with a
+                sentence saying why the auto-claim failed (e.g. "#7 is blocked by #3, #4").
 
 Nudges (PostToolUse, main agent only):
   TaskUpdate status=completed  additionalContext listing the ready tasks, newly
                                unblocked ones first (nothing if none are ready).
   Agent|Task                   additionalContext listing undispatched and ready tasks
-                               (nothing if there are none).
+                               (nothing if there are none). When this call auto-claimed a
+                               task, first a sentence "Auto-claimed task #id for <type> ..."
+                               (once, from the marker the PreToolUse claim left).
 
 Payload shapes, probed on Claude Code 2.1.319:
   PreToolUse Agent:       tool_input {description, prompt, subagent_type, run_in_background}
@@ -116,7 +125,7 @@ def env_exempt():
     return False
 
 
-def deny_reason(subagent, blocked=()):
+def deny_reason(subagent, blocked=(), note=""):
     text = ('No in_progress task owned by "%s". Before dispatching, TaskCreate a task for this work '
             '(or reuse one) and TaskUpdate it to status="in_progress", owner="%s" (load '
             'TaskCreate/TaskUpdate via ToolSearch if deferred), then retry the Agent call.'
@@ -124,6 +133,8 @@ def deny_reason(subagent, blocked=()):
     if blocked:
         text += (" Its in_progress task(s) %s still have open blockers; finish those first "
                  "(or remove the edge)." % ", ".join("#" + t for t in blocked))
+    if note:
+        text += " " + note
     return text
 
 
@@ -389,16 +400,70 @@ def check_task_update(sid, ti):
     return None
 
 
-def dispatch_gate(sid, subagent):
-    """(allowed, owned in_progress ids). On allow, marks the owner's in_progress tasks dispatched."""
+TASK_REF = re.compile(r"#(\d+)\b")
+
+
+def task_ref(ti):
+    """Id named by an Agent call: the first '#<n>' in description, else the first in prompt; None if neither."""
+    for field in ("description", "prompt"):
+        v = ti.get(field)
+        m = TASK_REF.search(v) if isinstance(v, str) else None
+        if m:
+            return m.group(1)
+    return None
+
+
+def claim_problem(state, tid):
+    """Why #tid cannot be auto-claimed, or None when it is ready (the is_ready rules)."""
+    e = state.get(tid)
+    if not isinstance(e, dict):
+        return "#%s is not in the task list" % tid
+    if e.get("status") != "pending":
+        return "#%s is %s" % (tid, e.get("status") or "unknown")
+    if e.get("owner"):
+        return "#%s is owned by %s" % (tid, e["owner"])
+    opn = open_among(state, e.get("blockedBy") or [])
+    if opn:
+        return "#%s is blocked by %s" % (tid, ", ".join("#" + b for b in opn))
+    if (e.get("metadata") or {}).get("dispatch") is False:
+        return "#%s has metadata dispatch false" % tid
+    return None
+
+
+def claim(state, tid, subagent, tool_use_id):
+    """Auto-claim #tid for subagent (in memory; the caller saves). Leaves a marker keyed by the
+    call's tool_use_id so PostToolUse can say so once."""
+    e = state[tid]
+    e["status"] = "in_progress"
+    e["owner"] = subagent
+    e["dispatched"] = True
+    e["metadata"]["auto_claimed"] = True
+    state.setdefault("_autoclaims", {})[tool_use_id or ""] = {"task": tid, "subagent": subagent}
+
+
+def dispatch_gate(sid, subagent, ti=None, tool_use_id=None):
+    """(allowed, owned in_progress ids, note). On allow, marks the owner's in_progress tasks dispatched.
+    With no unblocked in_progress task of the owner, the task the call names is auto-claimed when
+    ready; otherwise note says why the auto-claim failed."""
+    note = ""
     with Lock(sid):
         state = load(sid)
         ok, owned = owned_status(state, subagent)
+        if not ok:
+            tid = task_ref(ti or {})
+            if tid is not None:
+                why = ("%s already owns in_progress %s" % (subagent, ", ".join("#" + k for k in owned))
+                       if owned else claim_problem(state, tid))
+                if why is None:
+                    claim(state, tid, subagent, tool_use_id)
+                    ok = True
+                else:
+                    note = "Auto-claim of #%s failed: %s." % (tid, why)
         if ok:
             for k in owned:
                 state[k]["dispatched"] = True
             save(sid, state)
-    return ok, owned
+    return ok, owned, note
 
 
 # ---- PostToolUse recording and nudges -----------------------------------
@@ -528,6 +593,36 @@ def dispatch_nudge(sid):
     return "; ".join(parts) + ". Dispatch them now in one message, one Agent call each."
 
 
+AUTOCLAIM_TEXT = ("Auto-claimed task #%s for %s (gate state only; the TaskList UI still shows it pending "
+                  "— no TaskUpdate needed until completion).")
+
+
+def pop_autoclaim(sid, tool_use_id):
+    """The auto-claim the PreToolUse of this call recorded (removed from state), or None."""
+    with Lock(sid):
+        state = load(sid)
+        claims = state.get("_autoclaims")
+        if not isinstance(claims, dict) or (tool_use_id or "") not in claims:
+            return None
+        rec = claims.pop(tool_use_id or "")
+        if not claims:
+            state.pop("_autoclaims", None)
+        save(sid, state)
+    return rec if isinstance(rec, dict) else None
+
+
+def dispatch_post(sid, p):
+    """PostToolUse Agent|Task: the auto-claim note for this call, then the undispatched/ready nudge."""
+    claim_rec = pop_autoclaim(sid, (p or {}).get("tool_use_id"))
+    parts = []
+    if claim_rec:
+        parts.append(AUTOCLAIM_TEXT % (claim_rec.get("task"), claim_rec.get("subagent")))
+    nudge = dispatch_nudge(sid)
+    if nudge:
+        parts.append(nudge)
+    return " ".join(parts) or None
+
+
 def agent_id_from(resp):
     """agentId of an Agent/Task launch: tool_response dict key 'agentId' (also nested), else the
     'agentId: <hex>' line of the launch text (string, or content blocks with a text field)."""
@@ -607,7 +702,7 @@ def post(sid, tool, ti, resp, main_agent, p=None):
     if tool == "TaskUpdate":
         return post_update(sid, ti, main_agent, p)
     if tool in DISPATCH_TOOLS and main_agent:
-        return dispatch_nudge(sid)
+        return dispatch_post(sid, p)
     return None
 
 
@@ -666,10 +761,10 @@ def main():
                 log_line = "%s DENY Agent session=%s subagent=%s reviewer-model=%s effort=%s" % (
                     ts, sid[:36], subagent[:100], model, effort)
             else:
-                ok, owned = dispatch_gate(sid, subagent)
+                ok, owned, note = dispatch_gate(sid, subagent, ti, p.get("tool_use_id"))
                 if ok:
                     return
-                reason = deny_reason(subagent, owned)
+                reason = deny_reason(subagent, owned, note)
                 log_line = "%s DENY Agent session=%s subagent=%s" % (ts, sid[:36], subagent[:100])
     except Exception:
         return  # fail open
