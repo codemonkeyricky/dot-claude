@@ -419,11 +419,11 @@ class ReviewBypasses(unittest.TestCase):
     def test_brace_expansion_denied(self):
         # bash expands these into separate flags; the hook must see the braces and refuse.
         for c in ["sort {-o,/tmp/x} f", "find D {-delete,-print}", "find . {-fprint,F}",
-                  "git log {--output=F,--oneline}", "sort {--compress-program=X,-S1}",
-                  'grep "{" f']:  # braces in double quotes are refused too (simpler rule)
+                  "git log {--output=F,--oneline}", "sort {--compress-program=X,-S1}"]:
             self.assertDenied(c)
     def test_quoted_brace_allowed(self):
-        for c in ["grep '{' f", "grep -c '{' f", "find . -name '{}' -print"]:
+        # '{' inside double or single quotes is literal for bash, so it is allowed
+        for c in ["grep '{' f", "grep -c '{' f", "find . -name '{}' -print", 'grep "{" f', 'grep "a { b } c" f']:
             self.assertAllowed(c)
     def test_sed_in_place_denied(self):
         for c in ["sed -n s/a/b/p -i F", "sed -n p F -i", "sed -ni p F", "sed --in-pl p F", "sed -f s.sed F",
@@ -495,6 +495,71 @@ class ReviewBypasses(unittest.TestCase):
                     os.rmdir(root)
         finally:
             shutil.rmtree(outside, ignore_errors=True)
+
+
+class ShellRules(unittest.TestCase):
+    """Quote-aware shell rules: single quotes are fully literal, double quotes only let $ and backtick
+    through, newlines are refused, chains split at unquoted && || ;, a lone & is refused, and only the
+    four harmless redirects are allowed. Deny output must carry the reason."""
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+    def pl(self, cmd):
+        return {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": self.d}
+    def assertAllowed(self, cmd):
+        ok, why = mr.is_readonly_command(cmd)
+        self.assertTrue(ok, "%r: %s" % (cmd, why))
+        self.assertEqual(run(self.pl(cmd)), "allow", cmd)
+    def assertDenied(self, cmd):
+        self.assertFalse(mr.is_readonly_command(cmd)[0], cmd)
+        self.assertEqual(run(self.pl(cmd)), "deny", cmd)
+    def test_single_quoted_operators_allowed(self):
+        for c in ["jq '.a | select(.x>30)' f.json", "grep 'a|b' f", "grep 'a;b' f", "grep 'a&&b' f",
+                  "grep 'x > y' f", "grep 'a b' f", "grep 'x<y' f"]:
+            self.assertAllowed(c)
+    def test_double_quoted_operators_literal(self):
+        for c in ['grep "a|b" f', 'grep "a;b" f', 'grep "a&&b" f', 'grep "a||b" f', 'grep "x > y" f',
+                  'grep "x < y" f', 'grep "a & b" f']:
+            self.assertAllowed(c)
+    def test_quoted_redirect_names_not_refused(self):
+        self.assertAllowed('grep "2>/dev/null" f')
+        self.assertAllowed("grep '>/dev/null' f")
+    def test_allowed_redirects(self):
+        for c in ["cat f 2>/dev/null", "cat f >/dev/null", "cat f 2>&1", "cat f &>/dev/null",
+                  "cat f 2>/dev/null | head -3", "git status 2>/dev/null && git log -1",
+                  "git status 2>/dev/null; git log -1", "git status 2>&1 | head -2"]:
+            self.assertAllowed(c)
+    def test_other_redirects_denied(self):
+        for c in ["cat x > y", "cat f 2>/dev/nullx", "cat f 2>/tmp/x", "cat f 2>>/dev/null",
+                  "cat f > /dev/null", "cat f 2>&12", "cat < x", "cat f >&2", "cat f &>x"]:
+            self.assertDenied(c)
+    def test_newline_denied_even_quoted(self):
+        for c in ["ls\nrm x", "grep 'a\nb' f", 'grep "a\nb" f', "git status\r"]:
+            self.assertDenied(c)
+    def test_expansion_denied_outside_single_quotes(self):
+        for c in ['grep "a$" f', 'grep "x$HOME" f', 'grep "`id`" f', "cat `rm x`", "echo $(rm x)",
+                  "grep ${x} f", "grep $HOME f"]:
+            self.assertDenied(c)
+    def test_chains_split_and_checked(self):
+        for c in ["git status && git log -1", "git status || git log -1", "git status; git log -1",
+                  "git status ;git log -1", "git status ; git log -1 ; git branch --list"]:
+            self.assertAllowed(c)
+        for c in ["ls || rm x", "ls && rm x", "ls; rm -rf /", "git status && git push origin HEAD:master",
+                  "git status || curl -X POST https://a"]:
+            self.assertDenied(c)
+    def test_lone_background_ampersand_denied(self):
+        for c in ["sleep 1 & rm x", "git status &", "git status & git log -1"]:
+            self.assertDenied(c)
+    def test_deny_output_carries_reason(self):
+        cases = [("cat x > y", "redirection"), ("ls\nrm x", "newline"), ("echo $(rm x)", "expansion"),
+                 ("sleep 1 & rm x", "background"), ("rm x", "")]
+        for cmd, needle in cases:
+            msg = reason(self.pl(cmd))
+            self.assertIn("Read-only commands", msg, cmd)
+            self.assertIn("Rejected because:", msg, cmd)
+            if needle:
+                self.assertIn(needle, msg, cmd)
 
 
 if __name__ == "__main__":
