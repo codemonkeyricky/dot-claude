@@ -21,7 +21,7 @@ These rules apply to the main (top-level) session only. If you are a subagent/ex
 - Pick the tier from the PR diff (`gh pr view <ref> --json additions,deletions,files`), ignoring lockfiles and generated files:
   - **Skip review:** docs/comments only, renames or moves with no logic change, data/config value tweaks. Say in the report that review was skipped and why.
   - **Haiku review:** under ~50 changed lines with no logic, geometry, hook or security change. Dispatch a `pr-reviewer-N` with `model: "haiku"`.
-  - **Sonnet review (default):** everything else (logic, geometry, hooks/security, or 50+ changed lines). Dispatch `pr-reviewer-N` with no model override.
+  - **Opus review (default):** everything else (logic, geometry, hooks/security, or 50+ changed lines). Dispatch `pr-reviewer-N` with no model override.
 - At most 3 review rounds per PR, stated in the brief as `Review round N of 3`. Rounds 2 and 3 are re-reviews: give the reviewer the previously reviewed SHA and the previous round's findings so it reviews only the fix diff. If round 3 still returns CHANGES, stop and ask the user before more fixes.
 
 ## Main-session Bash (token budget)
