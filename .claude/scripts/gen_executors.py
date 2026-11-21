@@ -1,4 +1,4 @@
-"""Generate the named Haiku executor and Opus reviewer agent definitions.
+"""Generate the named Haiku executor and Sonnet reviewer agent definitions.
 
 Pools:
   executor  <- <root>/scripts/executor-template.md   -> <root>/agents/qorvax-tel.md ... plimm-oraxi.md

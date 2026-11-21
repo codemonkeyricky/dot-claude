@@ -2,7 +2,7 @@
   "env": {
     "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku-5-5"
   },
-  "autoCompactWindow": 120000,
+  "autoCompactWindow": 150000,
   "statusLine": {
     "type": "command",
     "command": "python3 -I ~/.claude/statusline.py",
