@@ -9,8 +9,9 @@ PostToolUse TaskCreate / TaskUpdate keep a per-session record in
   blockedBy   ids this task waits on (addBlockedBy; addBlocks adds the reverse edge)
   metadata    dict from TaskCreate / TaskUpdate; a null value deletes the key
   dispatched  True once an Agent/Task call was allowed for the owner
+  rounds      [{model, effort, ts}] one per allowed executor dispatch that marked the task
 Entries written before these keys existed load with the defaults (blockedBy [],
-metadata {}, dispatched False). Ids not in state (deleted, or never seen) count
+metadata {}, dispatched False, rounds []). Ids not in state (deleted, or never seen) count
 as satisfied blockers.
 
 Definitions:
@@ -24,6 +25,10 @@ Gates (PreToolUse, main agent only):
                 when status=in_progress is set on a task with open blockers; when
                 owner=X is set on an in_progress task while another task is already
                 in_progress with owner X.
+  Agent|Task    (main agent) subagent_type must be an executor, a reviewer, an EXEMPT_TYPES entry or
+                listed in model_gate.allow_types; anything else (general-purpose, fork, claude, a missing
+                subagent_type, an unknown name) is denied with a pointer to a Haiku executor. Logged as
+                "model-gate=type".
   Agent|Task    reviewer agents (opus-reviewer, pr-reviewer-*) are denied unless model is
                 omitted, "opus" or starts with "claude-opus", and effort is not low or
                 medium. This runs before the ownership check, so a denied call marks nothing
@@ -38,6 +43,18 @@ Gates (PreToolUse, main agent only):
                 in_progress, owner=subagent, dispatched=True, metadata.auto_claimed=True. The
                 call is then allowed. A named task that is not ready keeps the denial, with a
                 sentence saying why the auto-claim failed (e.g. "#7 is blocked by #3, #4").
+  Model gate    (Agent|Task, main agent) an executor is a subagent whose agent file
+                <agents dir>/<name>.md has frontmatter model: haiku (agents dir ~/.claude/agents, or
+                TASK_GATE_AGENTS_DIR; the name must match [A-Za-z0-9_-]+, so no path is read outside it).
+                model omitted, empty, "haiku" or "claude-haiku*" is allowed (then the ownership gate runs).
+                Any other model needs escalation proof for the task the call is for (the first unblocked
+                in_progress task the executor owns, else its first owned task, else the task the description
+                names): the task has an earlier allowed Haiku round in rounds and is not completed;
+                metadata.escalate_reason is a non-empty string; and the model is in model_gate.escalate_to
+                (default ["opus"]; "opus" also matches "claude-opus*"). A refused call claims and marks
+                nothing, logged as "model-gate=escalation". Every allowed executor call appends
+                {model, effort, ts} to rounds on each task it marks dispatched (model is "haiku" when
+                omitted). Reviewer calls are not recorded.
 
 Nudges (PostToolUse, main agent only):
   TaskUpdate status=completed  additionalContext listing the ready tasks, newly
@@ -62,9 +79,11 @@ Exemptions: CLAUDE_MAIN_WRITE=1, and sessions matched by exempt_env in the machi
 harness config (same file and rules as main-readonly.py: ~/.claude/hooks/harness.local.json,
 or the path in CLAUDE_HARNESS_CONFIG; see README.md, "Local config"). CLAUDE_REQUIRE_TASK=0
 is a kill switch for the gates. Agent|Task calls whose subagent_type is in EXEMPT_TYPES
-(read-only helper agents: web-fetch, claude-code-guide, Explore, Plan) are allowed
+(read-only helper agents: web-fetch, claude-code-guide, Explore) are allowed
 without a task. They all apply to the gates only; recording always runs. Subagent payloads (agent_id present) are never gated. Fails open on any exception or unparseable input.
-Denials are logged to ~/.claude/hooks/task-gate.log.
+Denials are logged to ~/.claude/hooks/task-gate.log (Agent denials tagged model-gate=type or
+model-gate=escalation when the model gate refused them). Plan is no longer exempt: it runs on the
+parent's model, so it is gated like any other non-executor type.
 
 State writes are load-modify-save under <state dir>/<session>.lock: O_EXCL create,
 retry every 50 ms up to 3 s, a lock older than 10 s is stale and removed. If the lock
@@ -77,6 +96,13 @@ one) appends one JSON line to ~/.claude/hooks/state/completed-work.jsonl with ki
 sits beside state/task-gate/, not inside it, so sweep() never deletes it and nothing in
 this hook trims it; it is the permanent record. TASK_GATE_COMPLETION_LOG overrides the
 path (tests). A failed write is ignored and the hook still fails open.
+
+Escalation log: each allowed non-Haiku executor dispatch appends one line to the same file,
+{kind "escalation", ts, session_id, task_id, subagent, model, effort, escalate_reason}.
+
+Harness config: the model_gate key of the same local file holds allow_types (extra allowed
+subagent types, default []) and escalate_to (models an escalation may name, default ["opus"]).
+TASK_GATE_AGENTS_DIR overrides the agents dir (tests).
 """
 import fnmatch, json, os, re, sys, tempfile, time
 
@@ -84,7 +110,9 @@ HOME = os.path.expanduser("~")
 DISPATCH_TOOLS = {"Agent", "Task"}
 GATED_TOOLS = DISPATCH_TOOLS | {"TaskUpdate"}
 DEFAULT_SUBAGENT = "general-purpose"
-EXEMPT_TYPES = {"web-fetch", "claude-code-guide", "Explore", "Plan"}
+EXEMPT_TYPES = {"web-fetch", "claude-code-guide", "Explore"}
+ESCALATE_DEFAULT = ["opus"]
+AGENT_NAME = re.compile(r"[A-Za-z0-9_-]+")
 MAX_AGE = 14 * 86400
 LOCK_WAIT = 3.0
 LOCK_STALE = 10.0
@@ -124,6 +152,103 @@ def env_exempt():
         if val and any(fnmatch.fnmatchcase(val, p) for p in pats):
             return True
     return False
+
+
+def load_model_gate():
+    """(allow_types, escalate_to) from the model_gate key of HARNESS_CONFIG. Never raises: a missing or
+    malformed file gives ([], ["opus"]); a malformed entry inside a list is skipped."""
+    allow, escalate = [], list(ESCALATE_DEFAULT)
+    try:
+        with open(HARNESS_CONFIG, encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("model_gate") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            if isinstance(raw.get("allow_types"), list):
+                allow = [x for x in raw["allow_types"] if isinstance(x, str) and x]
+            if isinstance(raw.get("escalate_to"), list):
+                escalate = [x for x in raw["escalate_to"] if isinstance(x, str) and x]
+    except Exception:
+        pass
+    return allow, escalate
+
+
+def agents_dir():
+    return os.environ.get("TASK_GATE_AGENTS_DIR") or os.path.join(HOME, ".claude", "agents")
+
+
+def agent_model(subagent):
+    """The lowercased model: value in the frontmatter of <agents dir>/<subagent>.md, or None. Only a plain
+    name is looked up, so no path outside the agents dir is read. Never raises."""
+    if not isinstance(subagent, str) or not AGENT_NAME.fullmatch(subagent):
+        return None
+    try:
+        with open(os.path.join(agents_dir(), subagent + ".md"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return None
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$", line)
+        if m and m.group(1) == "model":
+            return m.group(2).strip("\"'").lower() or None
+    return None
+
+
+def model_in(model, names):
+    """True when model is one of names; a name also matches 'claude-<name>...' (case-insensitive)."""
+    if not isinstance(model, str):
+        return False
+    m = model.lower()
+    return any(m == n.lower() or m.startswith("claude-" + n.lower()) for n in names)
+
+
+def is_haiku(model):
+    return model_in(model, ["haiku"])
+
+
+def allowed_type(subagent, allow_types):
+    """An executor (agent file with model: haiku) or an explicit model_gate.allow_types entry."""
+    return is_haiku(agent_model(subagent)) or subagent in allow_types
+
+
+TYPE_DENY = ('Subagent type "%s" is not allowed from the main session. Dispatch a Haiku executor instead: '
+             'one whose agent file in ~/.claude/agents has model: haiku (qorvax-tel, zyrene-vosk, thal-ummir, '
+             '...), with a task it owns. general-purpose, fork, claude and other types are not dispatchable.')
+ESCALATE_HINT = ('To escalate: after a Haiku round fails its acceptance checks, TaskUpdate the task with '
+                 'metadata {"escalate_reason": "<failed check>"}, then re-dispatch with model "opus".')
+
+
+def escalation_problem(state, subagent, ti, model):
+    """(problem, task id, escalate_reason). problem is None when the non-Haiku dispatch is proven: the task has
+    an earlier allowed Haiku round and is not completed, metadata.escalate_reason is set, and model is in
+    model_gate.escalate_to. The task is the first unblocked in_progress task the executor owns, else its first
+    owned task, else the task the call names. Read-only."""
+    _, escalate = load_model_gate()
+    owned = owned_status(state, subagent)[1]
+    tgt = next((k for k in owned if not open_among(state, state[k].get("blockedBy") or [])), None)
+    if tgt is None:
+        tgt = owned[0] if owned else task_ref(ti)
+    e = state.get(tgt) if tgt is not None else None
+    if not isinstance(e, dict):
+        return ("Model %r denied: no in_progress task owned by %s or named in the description to escalate. %s"
+                % (model, subagent, ESCALATE_HINT)), tgt, None
+    missing = []
+    if e.get("status") == "completed":
+        missing.append("#%s is already completed" % tgt)
+    elif not any(is_haiku(r.get("model")) for r in e.get("rounds") or [] if isinstance(r, dict)):
+        missing.append("no earlier Haiku round on #%s (dispatch it with model omitted first)" % tgt)
+    raw = (e.get("metadata") or {}).get("escalate_reason")
+    reason = raw.strip() if isinstance(raw, str) else ""
+    if not reason:
+        missing.append("no escalate_reason in #%s metadata" % tgt)
+    if not model_in(model, escalate):
+        missing.append("model %r is not in model_gate.escalate_to %s (local harness config)" % (model, escalate))
+    if missing:
+        return ("Model %r denied for #%s: %s. %s" % (model, tgt, "; ".join(missing), ESCALATE_HINT)), tgt, None
+    return None, tgt, reason
 
 
 def deny_reason(subagent, blocked=(), note=""):
@@ -181,12 +306,14 @@ def norm(e):
     md = e.get("metadata")
     e["metadata"] = md if isinstance(md, dict) else {}
     e["dispatched"] = e.get("dispatched") is True
+    rs = e.get("rounds")
+    e["rounds"] = [r for r in rs if isinstance(r, dict)] if isinstance(rs, list) else []
     return e
 
 
 def new_entry(subject=None):
     return {"status": "pending", "owner": None, "subject": subject,
-            "blockedBy": [], "metadata": {}, "dispatched": False}
+            "blockedBy": [], "metadata": {}, "dispatched": False, "rounds": []}
 
 
 def clean_meta(v):
@@ -469,36 +596,60 @@ def drop_autoclaim_records(state, tid):
         state.pop("_autoclaims", None)
 
 
-def dispatch_gate(sid, subagent, ti=None, tool_use_id=None):
-    """(allowed, owned in_progress ids, note). On allow, marks the owner's in_progress tasks dispatched.
-    With no unblocked in_progress task of the owner, the task the call names is auto-claimed when
-    ready; otherwise note says why the auto-claim failed."""
+def utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def dispatch_gate(sid, subagent, ti=None, tool_use_id=None, model=None, round_rec=None):
+    """Dict {ok, owned, note, model_problem, escalation}. model is the call's non-Haiku model (None when omitted
+    or Haiku). It is checked first, under the lock, by escalation_problem, so a refused call claims and marks
+    nothing. round_rec ({model, effort, ts}) is appended to each task an allowed call marks dispatched (None for
+    reviewers). escalation is the completion-log record of an allowed non-Haiku call. Otherwise: on allow, the
+    owner's in_progress tasks are marked dispatched. With no unblocked in_progress task of the owner, the task
+    the call names is auto-claimed when ready; note says why the auto-claim failed."""
+    ti = ti or {}
+    out = {"ok": False, "owned": [], "note": "", "model_problem": None, "escalation": None}
     note = ""
     with Lock(sid):
         state = load(sid)
+        tgt, reason = None, None
+        if model is not None:
+            out["model_problem"], tgt, reason = escalation_problem(state, subagent, ti, model)
+            if out["model_problem"]:
+                return out
         ok, owned = owned_status(state, subagent)
-        tid = task_ref(ti or {})
+        out["owned"] = owned
+        tid = task_ref(ti)
         own = state.get(tid) if tid is not None else None
+        claimed = None
         if (tool_use_id and isinstance(own, dict) and is_stale_claim(own) and own.get("owner") == subagent
                 and not open_among(state, own.get("blockedBy") or [])):
             # the same executor re-dispatching its own stuck auto-claim (its earlier call was denied or
             # never ran): the new call's marker replaces the old one
             claim(state, tid, subagent, tool_use_id)
-            ok = True
+            claimed, ok = tid, True
         elif not ok:
             if tid is not None:
                 why = ("%s already owns in_progress %s" % (subagent, ", ".join("#" + k for k in owned))
                        if owned else claim_problem(state, tid))
                 if why is None:
                     claim(state, tid, subagent, tool_use_id)
-                    ok = True
+                    claimed, ok = tid, True
                 else:
                     note = "Auto-claim of #%s failed: %s." % (tid, why)
         if ok:
-            for k in owned:
+            marked = list(owned) + ([claimed] if claimed and claimed not in owned else [])
+            for k in marked:
                 state[k]["dispatched"] = True
+                if round_rec:
+                    state[k].setdefault("rounds", []).append(dict(round_rec))
+            if model is not None and round_rec:
+                out["escalation"] = {"kind": "escalation", "ts": round_rec.get("ts"), "session_id": sid,
+                                     "task_id": tgt, "subagent": subagent, "model": round_rec.get("model"),
+                                     "effort": round_rec.get("effort"), "escalate_reason": reason}
             save(sid, state)
-    return ok, owned, note
+    out["ok"], out["note"] = ok, note
+    return out
 
 
 # ---- PostToolUse recording and nudges -----------------------------------
@@ -751,6 +902,43 @@ def post(sid, tool, ti, resp, main_agent, p=None):
     return None
 
 
+def agent_gate(sid, ti, tool_use_id, ts):
+    """Main-session Agent|Task decision: None to allow, else (reason, log_line). Order: exempt types; reviewers
+    (model/effort rule, then ownership); otherwise the type gate, the model gate, then ownership. A refused
+    call marks nothing."""
+    subagent = str(ti.get("subagent_type") or DEFAULT_SUBAGENT)
+    if subagent in EXEMPT_TYPES:
+        return None
+    if is_reviewer(subagent):
+        if not reviewer_ok(ti):
+            model, effort = ti.get("model"), ti.get("effort")
+            return (REVIEWER_DENY % (subagent, model, effort),
+                    "%s DENY Agent session=%s subagent=%s reviewer-model=%s effort=%s" % (
+                        ts, sid[:36], subagent[:100], model, effort))
+        res = dispatch_gate(sid, subagent, ti, tool_use_id)
+    else:
+        allow_types, _ = load_model_gate()
+        if not allowed_type(subagent, allow_types):
+            return (TYPE_DENY % subagent[:100],
+                    "%s DENY Agent session=%s subagent=%s model-gate=type" % (ts, sid[:36], subagent[:100]))
+        raw = ti.get("model")
+        omitted = raw in (None, "")
+        resolved = "haiku" if omitted else str(raw).lower()
+        requested = None if omitted or is_haiku(resolved) else resolved
+        rnd = {"model": resolved, "effort": ti.get("effort") or None, "ts": utc_now()}
+        res = dispatch_gate(sid, subagent, ti, tool_use_id, requested, rnd)
+        if res["model_problem"]:
+            return (res["model_problem"],
+                    "%s DENY Agent session=%s subagent=%s model-gate=escalation model=%s" % (
+                        ts, sid[:36], subagent[:100], resolved[:100]))
+        if res["escalation"]:
+            log_completion(res["escalation"])
+    if res["ok"]:
+        return None
+    return (deny_reason(subagent, res["owned"], res["note"]),
+            "%s DENY Agent session=%s subagent=%s" % (ts, sid[:36], subagent[:100]))
+
+
 def emit_deny(reason, log_line):
     try:
         with open(LOG, "a", encoding="utf-8", errors="replace") as f:
@@ -797,20 +985,10 @@ def main():
                 return
             log_line = "%s DENY TaskUpdate session=%s reason=%s" % (ts, sid[:36], reason[:200])
         else:
-            subagent = str(ti.get("subagent_type") or DEFAULT_SUBAGENT)
-            if subagent in EXEMPT_TYPES:
+            decision = agent_gate(sid, ti, p.get("tool_use_id"), ts)
+            if decision is None:
                 return
-            if is_reviewer(subagent) and not reviewer_ok(ti):
-                model, effort = ti.get("model"), ti.get("effort")
-                reason = REVIEWER_DENY % (subagent, model, effort)
-                log_line = "%s DENY Agent session=%s subagent=%s reviewer-model=%s effort=%s" % (
-                    ts, sid[:36], subagent[:100], model, effort)
-            else:
-                ok, owned, note = dispatch_gate(sid, subagent, ti, p.get("tool_use_id"))
-                if ok:
-                    return
-                reason = deny_reason(subagent, owned, note)
-                log_line = "%s DENY Agent session=%s subagent=%s" % (ts, sid[:36], subagent[:100])
+            reason, log_line = decision
     except Exception:
         return  # fail open
     emit_deny(reason, log_line)
