@@ -418,16 +418,21 @@ def is_stale_claim(e):
     return e.get("status") == "in_progress" and bool((e.get("metadata") or {}).get("auto_claim_pending"))
 
 
+STUCK_HINT = ('; if that claim is stuck (its call was denied), reset it with TaskUpdate status pending, '
+              'owner ""')
+
+
 def claim_problem(state, tid):
-    """Why #tid cannot be auto-claimed, or None when it is ready (the is_ready rules). A stale auto-claim
-    (in_progress with auto_claim_pending still set) may be taken over."""
+    """Why #tid cannot be auto-claimed, or None when it is ready (the is_ready rules). An in_progress task
+    is never taken here: a stale auto-claim (auto_claim_pending still set) is retaken only by its own
+    owner, in dispatch_gate. Any other executor is told how to reset it."""
     e = state.get(tid)
     if not isinstance(e, dict):
         return "#%s is not in the task list" % tid
-    stale = is_stale_claim(e)
-    if e.get("status") != "pending" and not stale:
-        return "#%s is %s" % (tid, e.get("status") or "unknown")
-    if e.get("owner") and not stale:
+    if e.get("status") != "pending":
+        hint = STUCK_HINT if e.get("status") == "in_progress" else ""
+        return "#%s is %s%s" % (tid, e.get("status") or "unknown", hint)
+    if e.get("owner"):
         return "#%s is owned by %s" % (tid, e["owner"])
     opn = open_among(state, e.get("blockedBy") or [])
     if opn:
@@ -447,9 +452,21 @@ def claim(state, tid, subagent, tool_use_id):
     e["dispatched"] = True
     e["metadata"]["auto_claimed"] = True
     e["metadata"].pop("auto_claim_pending", None)
+    drop_autoclaim_records(state, tid)  # a retaken claim replaces its earlier call's record
     if tool_use_id:
         e["metadata"]["auto_claim_pending"] = tool_use_id
         state.setdefault("_autoclaims", {})[tool_use_id] = {"task": tid, "subagent": subagent}
+
+
+def drop_autoclaim_records(state, tid):
+    """Forget every pending auto-claim record for #tid (its call's PostToolUse must not announce it)."""
+    claims = state.get("_autoclaims")
+    if not isinstance(claims, dict):
+        return
+    for k in [k for k, v in claims.items() if isinstance(v, dict) and v.get("task") == tid]:
+        claims.pop(k)
+    if not claims:
+        state.pop("_autoclaims", None)
 
 
 def dispatch_gate(sid, subagent, ti=None, tool_use_id=None):
@@ -460,8 +477,15 @@ def dispatch_gate(sid, subagent, ti=None, tool_use_id=None):
     with Lock(sid):
         state = load(sid)
         ok, owned = owned_status(state, subagent)
-        if not ok:
-            tid = task_ref(ti or {})
+        tid = task_ref(ti or {})
+        own = state.get(tid) if tid is not None else None
+        if (tool_use_id and isinstance(own, dict) and is_stale_claim(own) and own.get("owner") == subagent
+                and not open_among(state, own.get("blockedBy") or [])):
+            # the same executor re-dispatching its own stuck auto-claim (its earlier call was denied or
+            # never ran): the new call's marker replaces the old one
+            claim(state, tid, subagent, tool_use_id)
+            ok = True
+        elif not ok:
             if tid is not None:
                 why = ("%s already owns in_progress %s" % (subagent, ", ".join("#" + k for k in owned))
                        if owned else claim_problem(state, tid))

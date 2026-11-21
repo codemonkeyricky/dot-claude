@@ -650,6 +650,39 @@ class SendMessageTracking(T):
         self.update(1, status="completed")
         self.assertEqual(len(self.clog_lines()), 1)
 
+    # ---- stale auto-claims: only the same executor may retake one ----
+    def test_48_live_claim_not_taken_over_by_other_executor(self):
+        self.create(3)
+        self.assertEqual(self.pre("qorvax-tel", ti_extra={"description": "Qorvax · #3 fix"},
+                                  tuid="toolu_A").stdout, "")
+        r = self.pre("zyrene-vosk", ti_extra={"description": "Zyrene · #3 fix"}, tuid="toolu_B")
+        self.assertEqual(decision(r), "deny")
+        self.assertIn("TaskUpdate", json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
+        e = self.sA_state()["3"]
+        self.assertEqual((e["status"], e["owner"]), ("in_progress", "qorvax-tel"))
+        self.assertEqual(e["metadata"]["auto_claim_pending"], "toolu_A")
+
+    def test_49_stale_claim_retaken_by_same_executor_and_marker_replaced(self):
+        self.create(3)
+        self.assertEqual(self.pre("qorvax-tel", ti_extra={"description": "task #3"}, tuid="toolu_A").stdout, "")
+        self.assertEqual(self.pre("qorvax-tel", ti_extra={"description": "task #3"}, tuid="toolu_B").stdout, "")
+        state = self.sA_state()
+        self.assertEqual((state["3"]["status"], state["3"]["owner"]), ("in_progress", "qorvax-tel"))
+        self.assertEqual(state["3"]["metadata"]["auto_claim_pending"], "toolu_B")
+        self.assertEqual(list(state["_autoclaims"]), ["toolu_B"])
+        self.agent_post({"description": "task #3"}, "toolu_B")
+        self.assertNotIn("auto_claim_pending", self.sA_state()["3"]["metadata"])
+        self.assertNotIn("_autoclaims", self.sA_state())
+
+    def test_50_after_post_other_executor_still_denied(self):
+        self.create(3)
+        self.pre("qorvax-tel", ti_extra={"description": "task #3"}, tuid="toolu_A")
+        self.agent_post({"description": "task #3"}, "toolu_A")
+        self.assertNotIn("auto_claim_pending", self.sA_state()["3"]["metadata"])
+        r = self.pre("zyrene-vosk", ti_extra={"description": "task #3"}, tuid="toolu_B")
+        self.assertEqual(decision(r), "deny")
+        self.assertEqual(self.sA_state()["3"]["owner"], "qorvax-tel")
+
 
 if __name__ == "__main__":
     unittest.main()
