@@ -92,7 +92,7 @@ def main():
     if count >= _threshold():
         text = (
             f"This session has been compacted {count} times; each compaction loses detail "
-            "and re-reads cost a ~120k-token context per turn. At the next natural break, "
+            "and re-reads cost a ~150k-token context per turn. At the next natural break, "
             "write a handoff (state, branch/PR, next steps) to memory or a HANDOFF file "
             "and suggest the user continue in a fresh session."
         )
