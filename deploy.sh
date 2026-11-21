@@ -7,6 +7,10 @@
 # does not load it as project settings when run inside this repo). It is deep-merged into the
 # target's settings.json, not copied: keys from the repo win, other keys
 # already in the target are kept (dicts merge recursively; lists are replaced).
+# Exception for hooks: for each hooks.<Event> list present on both sides, the result is the repo
+# entries, followed by every target entry none of whose hooks[].command strings appear in the repo
+# entries for that event (order kept, no duplicates). So local-only hooks (e.g. deploy-trigger.py)
+# survive a deploy, and a stale copy of a repo hook is replaced by the repo's version.
 # The merge runs first in every mode, so a bad settings file stops the script before
 # any file is copied. The merged file keeps the mode of the target settings.json it replaces.
 # If the target settings.json is a symlink, the merged file is written to the real file it
@@ -72,6 +76,27 @@ def merge(base, over):
     return out
 
 
+def commands_of(entry):
+    hooks = entry.get("hooks", []) if isinstance(entry, dict) else []
+    if not isinstance(hooks, list):
+        return set()
+    return {h.get("command") for h in hooks
+            if isinstance(h, dict) and isinstance(h.get("command"), str)}
+
+
+def combine_hooks(repo_entries, target_entries):
+    repo_cmds = set()
+    for entry in repo_entries:
+        repo_cmds |= commands_of(entry)
+    out = list(repo_entries)
+    for entry in target_entries:
+        if commands_of(entry) & repo_cmds:
+            continue
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
 def load(path, label):
     try:
         with open(path, encoding="utf-8") as f:
@@ -86,7 +111,14 @@ def load(path, label):
 target, repo, out, dest = sys.argv[1:5]
 existing = load(target, "target settings.json") if os.path.exists(target) else {}
 incoming = load(repo, "repo settings.harness.json")
-text = json.dumps(merge(existing, incoming), indent=2) + "\n"
+merged = merge(existing, incoming)
+ex_hooks = existing.get("hooks")
+in_hooks = incoming.get("hooks")
+if isinstance(ex_hooks, dict) and isinstance(in_hooks, dict):
+    for event, repo_entries in in_hooks.items():
+        if isinstance(repo_entries, list) and isinstance(ex_hooks.get(event), list):
+            merged["hooks"][event] = combine_hooks(repo_entries, ex_hooks[event])
+text = json.dumps(merged, indent=2) + "\n"
 with open(out, "w", encoding="utf-8") as f:
     f.write(text)
 if os.path.exists(dest):
