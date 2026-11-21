@@ -32,7 +32,8 @@ Gates (PreToolUse, main agent only):
                 blocker. On allow, dispatched=True on all its in_progress tasks.
                 Auto-claim (one Agent call is enough): when no in_progress task owned by the
                 subagent is unblocked and it owns no in_progress task at all, the task the call
-                names (first '#<n>' in description, else first in prompt) is claimed if ready
+                names in its description ('· #<n>' or 'task #<n>', case-insensitive; the prompt
+                is never read) is claimed if ready
                 (pending, no owner, no open blocker, metadata.dispatch not False): status
                 in_progress, owner=subagent, dispatched=True, metadata.auto_claimed=True. The
                 call is then allowed. A named task that is not ready keeps the denial, with a
@@ -400,27 +401,33 @@ def check_task_update(sid, ti):
     return None
 
 
-TASK_REF = re.compile(r"#(\d+)\b")
+# Only these forms name a task, and only in the description: '· #<n>' (middle dot, optional spaces)
+# or 'task #<n>' (case-insensitive). A '#<n>' elsewhere (e.g. "review PR #5") names nothing.
+TASK_REF = re.compile(r"(?:\u00b7\s*|\btask )#(\d+)\b", re.IGNORECASE)
 
 
 def task_ref(ti):
-    """Id named by an Agent call: the first '#<n>' in description, else the first in prompt; None if neither."""
-    for field in ("description", "prompt"):
-        v = ti.get(field)
-        m = TASK_REF.search(v) if isinstance(v, str) else None
-        if m:
-            return m.group(1)
-    return None
+    """Id named by an Agent call's description, or None. The prompt is never read."""
+    v = ti.get("description")
+    m = TASK_REF.search(v) if isinstance(v, str) else None
+    return m.group(1) if m else None
+
+
+def is_stale_claim(e):
+    """True for an in_progress auto-claim whose call never reached PostToolUse (still has its marker)."""
+    return e.get("status") == "in_progress" and bool((e.get("metadata") or {}).get("auto_claim_pending"))
 
 
 def claim_problem(state, tid):
-    """Why #tid cannot be auto-claimed, or None when it is ready (the is_ready rules)."""
+    """Why #tid cannot be auto-claimed, or None when it is ready (the is_ready rules). A stale auto-claim
+    (in_progress with auto_claim_pending still set) may be taken over."""
     e = state.get(tid)
     if not isinstance(e, dict):
         return "#%s is not in the task list" % tid
-    if e.get("status") != "pending":
+    stale = is_stale_claim(e)
+    if e.get("status") != "pending" and not stale:
         return "#%s is %s" % (tid, e.get("status") or "unknown")
-    if e.get("owner"):
+    if e.get("owner") and not stale:
         return "#%s is owned by %s" % (tid, e["owner"])
     opn = open_among(state, e.get("blockedBy") or [])
     if opn:
@@ -431,14 +438,18 @@ def claim_problem(state, tid):
 
 
 def claim(state, tid, subagent, tool_use_id):
-    """Auto-claim #tid for subagent (in memory; the caller saves). Leaves a marker keyed by the
-    call's tool_use_id so PostToolUse can say so once."""
+    """Auto-claim #tid for subagent (in memory; the caller saves). Leaves a pending marker
+    (metadata.auto_claim_pending) keyed by the call's tool_use_id; PostToolUse clears it. Without a
+    tool_use_id nothing can be correlated, so no marker is stored (no shared key)."""
     e = state[tid]
     e["status"] = "in_progress"
     e["owner"] = subagent
     e["dispatched"] = True
     e["metadata"]["auto_claimed"] = True
-    state.setdefault("_autoclaims", {})[tool_use_id or ""] = {"task": tid, "subagent": subagent}
+    e["metadata"].pop("auto_claim_pending", None)
+    if tool_use_id:
+        e["metadata"]["auto_claim_pending"] = tool_use_id
+        state.setdefault("_autoclaims", {})[tool_use_id] = {"task": tid, "subagent": subagent}
 
 
 def dispatch_gate(sid, subagent, ti=None, tool_use_id=None):
@@ -598,17 +609,27 @@ AUTOCLAIM_TEXT = ("Auto-claimed task #%s for %s (gate state only; the TaskList U
 
 
 def pop_autoclaim(sid, tool_use_id):
-    """The auto-claim the PreToolUse of this call recorded (removed from state), or None."""
+    """PostToolUse for a call: clears its pending marker and removes its auto-claim record. Returns the
+    record when the claim is still held by the subagent it was made for, else None."""
+    if not tool_use_id:
+        return None
     with Lock(sid):
         state = load(sid)
         claims = state.get("_autoclaims")
-        if not isinstance(claims, dict) or (tool_use_id or "") not in claims:
+        if not isinstance(claims, dict) or tool_use_id not in claims:
             return None
-        rec = claims.pop(tool_use_id or "")
+        rec = claims.pop(tool_use_id)
         if not claims:
             state.pop("_autoclaims", None)
+        e = state.get(rec.get("task")) if isinstance(rec, dict) else None
+        held = False
+        if isinstance(e, dict):
+            meta = e.get("metadata") or {}
+            if meta.get("auto_claim_pending") == tool_use_id:
+                meta.pop("auto_claim_pending", None)
+            held = e.get("owner") == rec.get("subagent")
         save(sid, state)
-    return rec if isinstance(rec, dict) else None
+    return rec if isinstance(rec, dict) and held else None
 
 
 def dispatch_post(sid, p):

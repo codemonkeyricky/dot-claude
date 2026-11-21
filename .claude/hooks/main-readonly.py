@@ -541,28 +541,34 @@ def _split_chains(cmd):
     return [p.strip() for p in parts if p.strip()], ""
 
 
+def _pipe_stages(cmd):
+    """Split at unquoted, unescaped '|' only (the same quote tracking as _split_chains). A quoted or
+    backslash-escaped '|' stays inside its stage as an ordinary argument."""
+    live = set(_live_indices(cmd))
+    stages, start = [], 0
+    for i, c in enumerate(cmd):
+        if c == "|" and i in live:
+            stages.append(cmd[start:i])
+            start = i + 1
+    stages.append(cmd[start:])
+    return stages
+
+
 def _pipeline(cmd):
     """Allowlist check for one command or pipeline (no unquoted &&, || or ;). Returns (allowed, reason)."""
-    try:
-        # comments off: bash treats a mid-word '#' as literal, shlex would drop the rest of the line
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars="|")
-        lex.whitespace_split = True
-        lex.commenters = ""
-        tokens = list(lex)
-    except ValueError as e:
-        return False, "unparseable command: %s" % e
-    if any(t in BANNED_WORDS for t in tokens):
-        return False, "forbidden word in command"
-    segs, cur = [], []
-    for t in tokens:
-        if t == "|":
-            segs.append(cur)
-            cur = []
-        elif t and set(t) <= set("|"):  # an empty word is an argument (grep -c ""), not an operator
-            return False, "forbidden operator %s" % t
-        else:
-            cur.append(t)
-    segs.append(cur)
+    segs = []
+    for stage in _pipe_stages(cmd):
+        try:
+            # comments off: bash treats a mid-word '#' as literal, shlex would drop the rest of the line
+            lex = shlex.shlex(stage, posix=True)
+            lex.whitespace_split = True
+            lex.commenters = ""
+            tokens = list(lex)
+        except ValueError as e:
+            return False, "unparseable command: %s" % e
+        if any(t in BANNED_WORDS for t in tokens):
+            return False, "forbidden word in command"
+        segs.append(tokens)
     for seg in segs:
         ok, why = _segment(seg)
         if not ok:

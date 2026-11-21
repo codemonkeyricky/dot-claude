@@ -17,7 +17,11 @@ class T(unittest.TestCase):
         e = {"PATH": os.environ.get("PATH", ""), "HOME": self.home,
              "AGENT_BUDGET_STATE_DIR": self.budget, "TASK_GATE_STATE_DIR": self.tasks,
              "STATUSLINE_DEPLOY_LOG": self.deploy_log, "STATUSLINE_NOW": str(NOW)}
-        e.update(env or {})
+        for k, v in (env or {}).items():  # a None value removes the variable
+            if v is None:
+                e.pop(k, None)
+            else:
+                e[k] = v
         raw = payload if isinstance(payload, str) else json.dumps(payload)
         r = subprocess.run([sys.executable, SCRIPT], input=raw, capture_output=True,
                            text=True, env=e, timeout=10)
@@ -159,6 +163,45 @@ class T(unittest.TestCase):
         self.write_state(self.budget, SID, {"a": {"agent_type": "bad\nname", "count": 1, "last_ts": NOW}})
         out = self.run_sl(self.payload(name="Op\nus"))
         self.assertEqual(out, SEP.join(["Op us", "⚙ bad name 1c 0s"]))
+
+    def recent_prod_entry(self):
+        return {"target": "prod", "short": "82cb9fc", "verified": True, "ts": "2026-11-20T04:29:55Z"}
+
+    def test_deploy_segment_absent_without_env_or_config(self):
+        self.write_deploy(self.recent_prod_entry())
+        # a log at the old personal default location must not be read either
+        default = os.path.join(self.home, ".local", "state", "statusline")
+        os.makedirs(default)
+        with open(os.path.join(default, "deploys.jsonl"), "w") as f:
+            f.write(json.dumps(self.recent_prod_entry()) + "\n")
+        out = self.run_sl(self.payload(), env={"STATUSLINE_DEPLOY_LOG": None, "STATUSLINE_NOW": str(EPOCH + 60),
+                                               "CLAUDE_HARNESS_CONFIG": os.path.join(self.home, "absent.json")})
+        self.assertEqual(out, "Opus")
+        self.assertNotIn("deploy", out)
+
+    def test_deploy_segment_appears_with_env(self):
+        self.write_deploy(self.recent_prod_entry())
+        out = self.run_sl(self.payload(), env={"STATUSLINE_NOW": str(EPOCH + 60)})
+        self.assertEqual(out, SEP.join(["Opus", "deploy prod 82cb9fc verified 1m"]))
+
+    def test_deploy_segment_from_harness_config_key(self):
+        self.write_deploy(self.recent_prod_entry())
+        cfg = os.path.join(self.home, "harness.local.json")
+        with open(cfg, "w") as f:
+            json.dump({"agent_budget": {"default": {"soft": 150, "hard": 200}},
+                       "statusline": {"deploy_log": self.deploy_log}}, f)
+        out = self.run_sl(self.payload(), env={"STATUSLINE_DEPLOY_LOG": None, "STATUSLINE_NOW": str(EPOCH + 60),
+                                               "CLAUDE_HARNESS_CONFIG": cfg})
+        self.assertEqual(out, SEP.join(["Opus", "deploy prod 82cb9fc verified 1m"]))
+
+    def test_bad_harness_config_omits_deploy_segment(self):
+        self.write_deploy(self.recent_prod_entry())
+        cfg = os.path.join(self.home, "harness.local.json")
+        with open(cfg, "w") as f:
+            f.write("{not json")
+        out = self.run_sl(self.payload(), env={"STATUSLINE_DEPLOY_LOG": None, "CLAUDE_HARNESS_CONFIG": cfg,
+                                               "STATUSLINE_NOW": str(EPOCH + 60)})
+        self.assertEqual(out, "Opus")
 
 
 if __name__ == "__main__":

@@ -548,6 +548,17 @@ class ShellRules(unittest.TestCase):
         for c in ["ls || rm x", "ls && rm x", "ls; rm -rf /", "git status && git push origin HEAD:master",
                   "git status || curl -X POST https://a"]:
             self.assertDenied(c)
+    def test_quoted_pipe_is_an_argument_not_a_pipe(self):
+        for c in ['find . "|" cat -delete', "find . '|' cat -delete", 'git log "|" cat --output=x',
+                  'find . "|" cat -delete | head -1']:
+            self.assertDenied(c)
+        self.assertAllowed('grep "a|b" file')
+        self.assertAllowed("grep 'a|b' file")
+        self.assertAllowed("cat file | head")
+        self.assertAllowed("cat file \\| head")
+    def test_empty_pipe_stage_denied(self):
+        for c in ["cat f |", "| cat f", "cat f | | head"]:
+            self.assertDenied(c)
     def test_lone_background_ampersand_denied(self):
         for c in ["sleep 1 & rm x", "git status &", "git status & git log -1"]:
             self.assertDenied(c)

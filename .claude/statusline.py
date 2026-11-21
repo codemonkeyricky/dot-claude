@@ -10,7 +10,9 @@ model name (or an empty line) and exit 0.
 Env overrides (for tests and odd setups):
   AGENT_BUDGET_STATE_DIR  default ~/.claude/hooks/state/agent-budget
   TASK_GATE_STATE_DIR     default ~/.claude/hooks/state/task-gate
-  STATUSLINE_DEPLOY_LOG   default ~/.local/state/mechanical/deploys.jsonl
+  STATUSLINE_DEPLOY_LOG   deploy log path; else harness config key statusline.deploy_log
+                          (CLAUDE_HARNESS_CONFIG, default ~/.claude/hooks/harness.local.json).
+                          Neither set: the deploy segment is omitted.
   STATUSLINE_NOW          float epoch seconds used as "now"
 """
 import json
@@ -169,10 +171,27 @@ def parse_ts(value):
     return None
 
 
+def deploy_log_path(home):
+    """Deploy log path from env STATUSLINE_DEPLOY_LOG, else harness config statusline.deploy_log.
+    None when neither is set (or the config is unreadable): the deploy segment is then omitted."""
+    env = os.environ.get("STATUSLINE_DEPLOY_LOG")
+    if env:
+        return os.path.expanduser(env)
+    cfg_path = (os.environ.get("CLAUDE_HARNESS_CONFIG")
+                or os.path.join(home, ".claude", "hooks", "harness.local.json"))
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    sl = cfg.get("statusline") if isinstance(cfg, dict) else None
+    val = sl.get("deploy_log") if isinstance(sl, dict) else None
+    return os.path.expanduser(val) if isinstance(val, str) and val else None
+
+
 def deploy_segment(now, home):
-    path = os.environ.get("STATUSLINE_DEPLOY_LOG") or \
-        os.path.join(home, ".local", "state", "mechanical", "deploys.jsonl")
-    if not os.path.isfile(path):
+    path = deploy_log_path(home)
+    if not path or not os.path.isfile(path):
         return ""
     line = last_nonempty_line(path)
     if not line:

@@ -32,13 +32,13 @@ class T(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
-    def pre(self, subagent="general-purpose", sid="sA", tool="Agent", agent_id=None, env=None, omit_subagent=False, ti_extra=None):
+    def pre(self, subagent="general-purpose", sid="sA", tool="Agent", agent_id=None, env=None, omit_subagent=False, ti_extra=None, tuid="toolu_x"):
         ti = {"description": "d", "prompt": "p", "run_in_background": False}
         if not omit_subagent:
             ti["subagent_type"] = subagent
         ti.update(ti_extra or {})
         p = {"session_id": sid, "hook_event_name": "PreToolUse", "tool_name": tool,
-             "tool_input": ti, "tool_use_id": "toolu_x", "cwd": self.root}
+             "tool_input": ti, "tool_use_id": tuid, "cwd": self.root}
         if agent_id:
             p["agent_id"] = agent_id
         return self._run(json.dumps(p), env)
@@ -563,17 +563,31 @@ class SendMessageTracking(T):
         self.assertEqual((e["status"], e["owner"], e["dispatched"]), ("in_progress", "X", True))
         self.assertIs(e["metadata"]["auto_claimed"], True)
 
-    def test_41_autoclaim_from_prompt_when_description_has_none(self):
-        self.create(3)
-        self.assertEqual(self.pre("X", ti_extra={"description": "no ref", "prompt": "work on #3 now"}).stdout, "")
-        self.assertEqual(self.sA_state()["3"]["owner"], "X")
+    def test_41_prompt_is_never_read_for_the_task_ref(self):
+        self.create(7)
+        r = self.pre("X", ti_extra={"description": "no ref", "prompt": "work on task #7 now"})
+        self.assertEqual(decision(r), "deny")
+        self.assertEqual(self.sA_state()["7"]["status"], "pending")
+
+    def test_41b_only_middle_dot_or_task_forms_claim(self):
+        self.create(5)
+        self.create(10)
+        self.assertEqual(decision(self.pre("X", ti_extra={"description": "review PR #5"})), "deny")
+        self.assertEqual(self.sA_state()["5"]["status"], "pending")
+        self.assertEqual(self.pre("X", ti_extra={"description": "Qorvax Tel \u00b7 #10 fixes"}).stdout, "")
+        self.assertEqual(self.sA_state()["10"]["owner"], "X")
+
+    def test_41c_task_form_is_case_insensitive(self):
+        self.create(10)
+        self.assertEqual(self.pre("X", ti_extra={"description": "Task #10 fixes"}).stdout, "")
+        self.assertEqual(self.sA_state()["10"]["owner"], "X")
 
     def test_42_autoclaim_denied_with_reason_when_blocked(self):
         self.create(1)
         self.create(2)
         self.create(3)
         self.update(3, addBlockedBy=["1", "2"])
-        r = self.pre("X", ti_extra={"description": "#3"})
+        r = self.pre("X", ti_extra={"description": "task #3"})
         self.assertEqual(decision(r), "deny")
         reason = json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn("Auto-claim of #3 failed: #3 is blocked by #1, #2.", reason)
@@ -583,7 +597,7 @@ class SendMessageTracking(T):
     def test_43_autoclaim_denied_when_owned_by_someone_else(self):
         self.create(1)
         self.update(1, owner="Y")
-        r = self.pre("X", ti_extra={"description": "#1"})
+        r = self.pre("X", ti_extra={"description": "task #1"})
         self.assertEqual(decision(r), "deny")
         self.assertIn("Auto-claim of #1 failed: #1 is owned by Y.",
                       json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
@@ -592,7 +606,7 @@ class SendMessageTracking(T):
     def test_44_autoclaim_denied_when_dispatch_false(self):
         self.create(1)
         self.update(1, metadata={"dispatch": False})
-        r = self.pre("X", ti_extra={"description": "#1"})
+        r = self.pre("X", ti_extra={"description": "task #1"})
         self.assertEqual(decision(r), "deny")
         self.assertIn("Auto-claim of #1 failed: #1 has metadata dispatch false.",
                       json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"])
@@ -602,28 +616,28 @@ class SendMessageTracking(T):
         self.create(1)
         self.create(2)
         self.update(1, status="in_progress", owner="X")
-        self.assertEqual(self.pre("X", ti_extra={"description": "#2"}).stdout, "")
+        self.assertEqual(self.pre("X", ti_extra={"description": "task #2"}).stdout, "")
         self.assertEqual((self.sA_state()["2"]["status"], self.sA_state()["2"]["owner"]), ("pending", None))
         self.assertEqual((self.sA_state()["1"]["status"], self.sA_state()["1"]["owner"]), ("in_progress", "X"))
         self.assertNotIn("auto_claimed", self.sA_state()["1"]["metadata"])
 
     def test_46_exempt_type_unaffected_by_autoclaim(self):
         self.create(3)
-        r = self.pre("Explore", ti_extra={"description": "#3"})
+        r = self.pre("Explore", ti_extra={"description": "task #3"})
         self.assertEqual(r.stdout, "")
         self.assertEqual(self.sA_state()["3"]["status"], "pending")
 
     def test_47_completion_after_autoclaim_logs_and_nudges(self):
         self.create(1)
         self.create(3)
-        self.assertEqual(self.pre("X", ti_extra={"description": "#1"}).stdout, "")
-        text = self.ctx(self.agent_post({"description": "#1"}, "toolu_x"))
+        self.assertEqual(self.pre("X", ti_extra={"description": "task #1"}).stdout, "")
+        text = self.ctx(self.agent_post({"description": "task #1"}, "toolu_x"))
         self.assertIn("Auto-claimed task #1 for X (gate state only; the TaskList UI still shows it pending "
                       "— no TaskUpdate needed until completion).", text)
         self.assertIn("ready: #3", text)
         self.assertNotIn("_autoclaims", self.sA_state())
         # the marker is used once: the same call id again announces nothing
-        self.assertNotIn("Auto-claimed", self.ctx(self.agent_post({"description": "#1"}, "toolu_x")))
+        self.assertNotIn("Auto-claimed", self.ctx(self.agent_post({"description": "task #1"}, "toolu_x")))
         text = self.ctx(self.update(1, status="completed"))
         self.assertIn("Task #1 completed", text)
         self.assertIn('#3 "probe"', text)
