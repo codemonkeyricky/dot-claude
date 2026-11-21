@@ -14,9 +14,14 @@ CLAUDE_HARNESS_CONFIG, or ~/.claude/hooks/harness.local.json. See README.md, "Lo
 A missing, unreadable or malformed file, or a malformed entry, means no scripts and no
 exemptions. Globs use fnmatch.fnmatchcase, so matching is case-sensitive.
 
-Shell rules (Bash): the command must pass a read-only allowlist. Shell comments are off
-(a mid-word '#' is literal, as in bash). Any '$' or '{' outside single quotes is refused, since bash
-expands it (braces are refused inside double quotes too, a simpler rule). Each command's banned
+Shell rules (Bash): the command must pass a read-only allowlist. Quoting follows bash. Single quotes are
+fully literal, so nothing inside them counts. Inside double quotes only '$' and backtick count (they expand);
+';', '&', '|', '<', '>', '{' and '}' are literal there. Outside quotes a backslash makes the next character
+literal, but '$', backtick and '{' are still refused. Newline and CR are refused everywhere. The command is
+split at unquoted '&&', '||' and ';', and every non-empty part must pass the pipeline checks below. A lone '&'
+(background) is refused. The redirects 2>/dev/null, >/dev/null, 2>&1 and &>/dev/null are allowed when unquoted
+and delimited, and are stripped before the check; any other '<' or '>' is refused. Shell comments are off
+(a mid-word '#' is literal, as in bash). Each command's banned
 options (SIMPLE_BAD_FLAGS) are matched option-aware: a long name is refused when any banned long
 option starts with it (GNU prefixes), and a short cluster when it holds a banned letter. sed is
 print/delete/substitute only, with no -i, -f, -s or extra scripts. git --output and --ext-diff
@@ -145,7 +150,9 @@ def deny(reason, tool, detail):
 # ---- read-only shell allowlist (pure; tested in test_main_readonly.py) ----
 
 BANNED_WORDS = {"tee", "xargs", "eval", "exec", "source", "sudo"}
-BAD_CHARS = [";", "&", ">", "<", "`", "$(", "${", "\n", "\r"]  # covers ; && || lone & > < $( backtick newline
+BAD_CHARS = ["\n", "\r"]  # refused everywhere, quotes or not
+EXPANSION_CHARS = "$`{"  # refused outside single quotes (see _unquoted_hit)
+REDIRECT_OK = re.compile(r"\d?>&1|&>/dev/null|\d?>/dev/null")  # the only redirects allowed (when unquoted)
 SIMPLE_CMDS = {"cat", "head", "tail", "wc", "ls", "stat", "readlink", "realpath", "file", "du", "df",
                "ps", "ss", "pgrep", "date", "pwd", "whoami", "which", "jq", "grep", "rg", "sort", "uniq",
                "cut", "tr", "column", "basename", "dirname", "nproc", "free", "uptime"}
@@ -419,42 +426,123 @@ def _segment(tokens):
     return False, "command %s is not in the read-only allowlist" % cmd
 
 
+DQ_LIVE = "$`"  # the only characters that still expand inside double quotes
+
+
 def _unquoted_hit(cmd, chars):
-    """True if a character in chars occurs outside single quotes, where bash would expand it ('$', '{').
-    Tracks bash quoting: inside '...' nothing is special; outside it a backslash escapes the next
-    character (so \\' does not open a quote). A listed character is reported even when it is escaped
-    or inside double quotes: bash expands '$' there, and '{' is refused there too (a simpler rule)."""
+    """True if a character in chars is live for bash. Outside double and single quotes a listed character
+    is refused even when backslash-escaped. Inside double quotes only DQ_LIVE characters count, so '{' and
+    the operators are literal there. Inside single quotes nothing counts. Outside quotes a backslash
+    escapes the next character, so an escaped quote does not open a quote."""
     state = None  # None (unquoted), "'" (single), or '"' (double)
     i = 0
     while i < len(cmd):
         c = cmd[i]
+        nxt = cmd[i + 1] if i + 1 < len(cmd) else ""
         if state == "'":
             if c == "'":
                 state = None
+        elif state == '"':
+            if c in DQ_LIVE and c in chars:
+                return True
+            if c == "\\":
+                if nxt and nxt in DQ_LIVE and nxt in chars:
+                    return True
+                i += 1  # skip the escaped character
+            elif c == '"':
+                state = None
         elif c == "\\":
-            if i + 1 < len(cmd) and cmd[i + 1] in chars:
+            if nxt and nxt in chars:
                 return True
             i += 1  # skip the escaped character
         elif c in chars:
             return True
-        elif state == '"':
-            if c == '"':
-                state = None
         elif c in "'\"":
             state = c
         i += 1
     return False
 
 
-def is_readonly_command(cmd):
-    """Strict allowlist for read-only shell commands. Returns (allowed, reason)."""
-    if not isinstance(cmd, str) or not cmd.strip():
-        return False, "empty command"
-    for bad in BAD_CHARS:
-        if bad in cmd:
-            return False, "forbidden shell syntax %r" % bad
-    if _unquoted_hit(cmd, "${"):
-        return False, "unquoted or double-quoted $ or { (expansion)"
+def _live_indices(cmd):
+    """Indices of characters bash reads as syntax: not inside single or double quotes, and not
+    backslash-escaped outside quotes (an escaped character is an ordinary word character)."""
+    out = []
+    state = None
+    i = 0
+    while i < len(cmd):
+        c = cmd[i]
+        if state == "'":
+            if c == "'":
+                state = None
+        elif state == '"':
+            if c == '"':
+                state = None
+            elif c == "\\":
+                i += 1
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            state = c
+        else:
+            out.append(i)
+        i += 1
+    return out
+
+
+def _strip_redirects(cmd):
+    """(cmd with allowed redirects blanked, "") or (None, reason). A redirect is allowed only when it is
+    one of REDIRECT_OK, unquoted, not glued to a preceding < > &, and followed by whitespace, an operator
+    or the end (so /dev/nullx is not taken for /dev/null). Any other live < or > is refused. Each allowed
+    redirect is replaced by a space so that neighbouring words do not merge."""
+    live = set(_live_indices(cmd))
+    spans = []
+    i = 0
+    while i < len(cmd):
+        if i in live:
+            m = REDIRECT_OK.match(cmd, i)
+            if (m and (m.end() == len(cmd) or cmd[m.end()] in " \t|;&")
+                    and (i == 0 or cmd[i - 1] not in "<>&")):
+                spans.append((i, m.end()))
+                i = m.end()
+                continue
+            if cmd[i] in "<>":
+                return None, "redirection not allowed (only 2>/dev/null, >/dev/null, 2>&1, &>/dev/null)"
+        i += 1
+    out, pos = [], 0
+    for a, b in spans:
+        out.append(cmd[pos:a])
+        out.append(" ")
+        pos = b
+    out.append(cmd[pos:])
+    return "".join(out), ""
+
+
+def _split_chains(cmd):
+    """(parts, "") split at unquoted '&&', '||' and ';' (blank parts dropped), or (None, reason) when an
+    unquoted lone '&' (background) is present."""
+    live = set(_live_indices(cmd))
+    parts, start, i = [], 0, 0
+    while i < len(cmd):
+        if i in live:
+            if cmd[i:i + 2] in ("&&", "||") and i + 1 in live:
+                parts.append(cmd[start:i])
+                i += 2
+                start = i
+                continue
+            if cmd[i] == ";":
+                parts.append(cmd[start:i])
+                i += 1
+                start = i
+                continue
+            if cmd[i] == "&":
+                return None, "background & not allowed"
+        i += 1
+    parts.append(cmd[start:])
+    return [p.strip() for p in parts if p.strip()], ""
+
+
+def _pipeline(cmd):
+    """Allowlist check for one command or pipeline (no unquoted &&, || or ;). Returns (allowed, reason)."""
     try:
         # comments off: bash treats a mid-word '#' as literal, shlex would drop the rest of the line
         lex = shlex.shlex(cmd, posix=True, punctuation_chars="|")
@@ -477,6 +565,32 @@ def is_readonly_command(cmd):
     segs.append(cur)
     for seg in segs:
         ok, why = _segment(seg)
+        if not ok:
+            return False, why
+    return True, ""
+
+
+def is_readonly_command(cmd):
+    """Strict allowlist for read-only shell commands. Returns (allowed, reason). Newlines are refused
+    everywhere; expansions are refused outside single quotes; allowed redirects are blanked; the command
+    is split at unquoted && || ; and every part must pass _pipeline."""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False, "empty command"
+    for bad in BAD_CHARS:
+        if bad in cmd:
+            return False, "newline or carriage return not allowed"
+    if _unquoted_hit(cmd, EXPANSION_CHARS):
+        return False, "shell expansion ($, backtick or {) not allowed outside single quotes"
+    stripped, why = _strip_redirects(cmd)
+    if stripped is None:
+        return False, why
+    parts, why = _split_chains(stripped)
+    if parts is None:
+        return False, why
+    if not parts:
+        return False, "empty command"
+    for part in parts:
+        ok, why = _pipeline(part)
         if not ok:
             return False, why
     return True, ""
@@ -519,16 +633,17 @@ def main():
     if p.get("agent_id"):
         return  # subagent: unrestricted
     if tool in SHELL_TOOLS:
+        why = ""
         if tool == "Bash":
             try:
-                ok, _why = is_readonly_command(ti.get("command", ""))
+                ok, why = is_readonly_command(ti.get("command", ""))
             except Exception:
-                ok = False
+                ok, why = False, "internal error"
             if ok:
                 return
         deny("Shell is disabled for the main agent (no creative edits via shell). "
              "Read-only commands (git log/status/diff…, curl -s URL, cat/grep/ls, scripts listed in the local harness config) are allowed. "
-             + hint(), tool, str(ti.get("command", "")))
+             + hint() + (" Rejected because: " + why if why else ""), tool, str(ti.get("command", "")))
     if tool in WRITE_TOOLS:
         path = ti.get(WRITE_TOOLS[tool], "")
         if not path_allowed(path, cwd):
