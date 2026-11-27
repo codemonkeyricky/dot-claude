@@ -7,8 +7,26 @@ CLEAR = ("CLAUDE_REQUIRE_TASK", "CLAUDE_MAIN_WRITE", "CLAUDE_PLAN_GATE", "HARNES
 SID = "sA"
 
 
-def plan_md(obj):
-    return "# Plan\n\nSome prose.\n\n```tasks\n" + json.dumps(obj) + "\n```\n"
+def files_md(obj):
+    """A ```files block that matches obj's writes: one flat leaf per written path, tagged with its task ids."""
+    tasks = obj.get("tasks", []) if isinstance(obj, dict) else obj
+    ids, raw = {}, {}
+    for t in tasks:
+        if isinstance(t, dict) and isinstance(t.get("id"), str):
+            for w in t.get("writes") or []:
+                if isinstance(w, str):
+                    key = w.replace("\\", "/").lower()  # same normalisation as the hook's norm_path
+                    while key.startswith("./"):
+                        key = key[2:]
+                    raw.setdefault(key, w)
+                    ids.setdefault(key, []).append(t["id"])
+    lines = ["%s  [%s]" % (raw[k], ", ".join(sorted(set(v)))) for k, v in ids.items()]
+    return "```files\n" + "".join(line + "\n" for line in lines) + "```\n"
+
+
+def plan_md(obj, files=True):
+    text = "# Plan\n\nSome prose.\n\n```tasks\n" + json.dumps(obj) + "\n```\n"
+    return text + ("\n" + files_md(obj) if files else "")
 
 
 def task(tid, writes=(), needs=None, dispatch=None, subject=None):
@@ -609,3 +627,131 @@ def test_54_stale_lock_is_removed_and_read_is_fast(hook):
     assert dispatch(hook) == ""
     assert time.time() - t0 < 2.0
     assert not os.path.exists(lock)  # taken over as stale, released after the read
+
+
+# ---- ```files block ---------------------------------------------------------
+
+def plan_with(obj, files_body):
+    return "# Plan\n\n```tasks\n" + json.dumps(obj) + "\n```\n\n```files\n" + files_body + "\n```\n"
+
+
+def load_gate():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("plan_gate_under_test", HOOK)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_55_nested_tree_passes(hook):
+    body = "src/\n  a.py  [A]  new\n  b.py  [B]  edit\ndocs/\n  c.md  [C]"
+    assert hook.exit_plan(plan_with(wide_plan(), body)) == ""
+
+
+def test_56_box_drawing_tree_passes(hook):
+    body = "src/\n├── a.py  [A]  new\n|-- b.py  [B]\ndocs/\n`-- c.md  [C]"
+    assert hook.exit_plan(plan_with(wide_plan(), body)) == ""
+
+
+def test_57_multi_segment_dir_and_directory_leaf_pass(hook):
+    obj = {"tasks": [task("A", ["src/parser/x.py"]), task("C", ["docs/"])]}
+    body = "src/parser/\n  x.py  [A]\ndocs/  [C]  whole folder"
+    assert hook.exit_plan(plan_with(obj, body)) == ""
+
+
+def test_58_glob_leaf_passes(hook):
+    obj = {"tasks": [task("A", ["db/*.sql"]), task("B", ["db/schema.md"])]}
+    body = "db/\n  *.sql  [A]\n  schema.md  [B]"
+    assert hook.exit_plan(plan_with(obj, body)) == ""
+
+
+def test_59_missing_files_block_denied(hook):
+    out = hook.exit_plan("# Plan\n\n```tasks\n" + json.dumps(wide_plan()) + "\n```\n")
+    assert decision(out) == "deny"
+    assert "no ```files block in the plan" in reason(out)
+
+
+def test_60_two_files_blocks_denied(hook):
+    out = hook.exit_plan(plan_md(wide_plan()) + files_md(wide_plan()))
+    assert decision(out) == "deny"
+    assert "the plan has 2 ```files blocks; keep exactly one" in reason(out)
+
+
+def test_61_missing_file_denied(hook):
+    out = hook.exit_plan(plan_with(wide_plan(), "src/a.py  [A]\nsrc/b.py  [B]"))
+    assert decision(out) == "deny"
+    assert "files block is missing docs/c.md (written by #C)" in reason(out)
+
+
+def test_62_extra_file_denied(hook):
+    out = hook.exit_plan(plan_with(wide_plan(), "src/a.py  [A]\nsrc/b.py  [B]\ndocs/c.md  [C]\nx.txt  [A]"))
+    assert decision(out) == "deny"
+    assert "files block lists x.txt, which no task writes" in reason(out)
+
+
+def test_63_wrong_ids_denied(hook):
+    out = hook.exit_plan(plan_with(wide_plan(), "src/a.py  [A, B]\nsrc/b.py  [B]\ndocs/c.md  [C, Z]"))
+    assert decision(out) == "deny"
+    assert "files block: src/a.py is tagged [A, B] but is written by [A]" in reason(out)
+    assert "files block: docs/c.md is tagged [C, Z] but is written by [C]" in reason(out)
+
+
+def test_64_duplicate_leaf_denied(hook):
+    out = hook.exit_plan(plan_with(wide_plan(), "src/a.py  [A]\nsrc/a.py  [A]\nsrc/b.py  [B]\ndocs/c.md  [C]"))
+    assert decision(out) == "deny"
+    assert "files block lists src/a.py more than once" in reason(out)
+
+
+def test_65_bad_line_shape_denied_with_line_number(hook):
+    out = hook.exit_plan(plan_with(wide_plan(), "src/a.py\nsrc/b.py  [B]\ndocs/c.md  [C]"))
+    assert decision(out) == "deny"
+    assert "files block line 1 is neither a directory" in reason(out)
+
+
+def test_66_no_writes_passes_without_files_block(hook):
+    obj = {"tasks": [task("A"), task("B")]}
+    assert hook.exit_plan(plan_md(obj, files=False)) == ""
+
+
+def test_67_no_writes_files_block_with_file_lines_denied(hook):
+    obj = {"tasks": [task("A"), task("B")]}
+    out = hook.exit_plan(plan_with(obj, "x.py  [A]"))
+    assert decision(out) == "deny"
+    assert "must have no file lines" in reason(out)
+
+
+def test_68_plan_require_files_false_skips_checks(hook):
+    with open(hook.harness, "w", encoding="utf-8") as f:
+        json.dump({"plan_require_files": False}, f)
+    assert hook.exit_plan(plan_md(wide_plan(), files=False)) == ""
+    assert hook.exit_plan(plan_with(wide_plan(), "src/a.py  [A]")) == ""
+
+
+def test_69_deny_text_prints_expected_files_block(hook):
+    r = reason(hook.exit_plan(plan_with(wide_plan(), "src/a.py  [A]\nsrc/b.py  [B]")))
+    assert "files block is missing docs/c.md (written by #C)" in r
+    assert "Expected ```files block (generated from writes; paste it and add notes):" in r
+    assert "```files\ndocs/\n  c.md  [C]\nsrc/\n  a.py  [A]\n  b.py  [B]\n```" in r
+
+
+def test_70_render_files_tree_round_trips(hook):
+    mod = load_gate()
+    tasks = [task("A", ["src/parser/x.py", "src/parser/y.py"]), task("B", ["src/z.py"]),
+             task("C", ["docs/"]), task("D", ["src/parser/*.sql"]), task("E", ["src/parser/x.py"])]
+    leaves, problems = mod.parse_files_tree(mod.render_files_tree(tasks))
+    assert problems == []
+    assert mod.tree_problems(tasks, leaves) == []
+    assert sorted((lf["path"], tuple(sorted(lf["ids"]))) for lf in leaves) == [
+        ("docs/", ("C",)), ("src/parser/*.sql", ("D",)), ("src/parser/x.py", ("A", "E")),
+        ("src/parser/y.py", ("A",)), ("src/z.py", ("B",))]
+
+
+def test_71_post_context_lists_files_changed(hook):
+    ctx = hook.make_plan_json(wide_plan())
+    assert "Files changed:" in ctx
+    assert "a.py  [A]" in ctx and "c.md  [C]" in ctx
+
+
+def test_72_no_plan_text_message_shows_files_block(hook):
+    out = hook.exit_plan(None)
+    assert "```files" in reason(out)

@@ -14,6 +14,24 @@ tasks, or an object {"serial_reason": str (optional), "tasks": [...]}. A task:
   writes    list of path/glob strings (may be [])
   needs     optional object {other_id: non-empty reason string}
   dispatch  optional bool, default true (false: the caller's or the user's own task, never an executor's)
+The plan must also contain exactly one ```files block: a directory tree of every file the tasks write, laid out as
+in the project. It is optional only when no task writes anything, and then it must have no file lines. Format:
+  directory line  a name ending in "/" with no [ids] list; the name may hold several segments ("src/parser/");
+                  text after the name is a note and is ignored
+  file line       <name>  [<ids>]  <note>; <ids> is a comma and/or space separated list of task ids. The name may
+                  hold "/", be a glob ("*.sql"), or be a directory written as one write entry ("docs/  [C]": a
+                  name ending in "/" WITH an id list is a leaf)
+  box-drawing prefixes (│, ├──, └──, |--, `--) and spaces are indentation; depth is the column where the name
+  starts, and a line's parent is the nearest earlier directory line with a smaller depth.
+The full path of a leaf is its ancestor directory names joined with its name. Blank lines are ignored. Any other
+line shape is a problem naming the line number. Checks, comparing normalised paths (norm_path):
+  every task write must appear as a leaf    "files block is missing <path> (written by #A)"
+  every leaf must equal some write          "files block lists <path>, which no task writes"
+  a leaf's id set must equal exactly the tasks whose writes contain it
+                                            "files block: <path> is tagged [X] but is written by [A, B]"
+  no duplicate leaves
+The checks run in lint() only when the tasks block parsed and has no cycle. Problems join the same deny list, and
+the deny text prints the tree generated from the writes (render_files_tree).
 
 Edges (B waits for A) are computed from the block itself, never from the task list:
   A is in B.needs, OR A appears earlier in the list than B and their writes overlap.
@@ -33,7 +51,8 @@ Gates (main session only; a payload with agent_id is a subagent and is never gat
                            plan_max_writes write entries ("split #X"); a pure chain: at least 4
                            dispatchable tasks and a critical path (longest chain, counting dispatchable tasks only;
                            paths still pass through dispatch:false tasks) equal to their number, with no
-                           serial_reason. Otherwise allowed (no output), and the resolved plan is recorded in
+                           serial_reason; no ```files block, more than one, or a ```files tree that does not match the writes (see above).
+                           Otherwise allowed (no output), and the resolved plan is recorded in
                            <state dir>/<safe session>.plan-pending.json = {path, source, sha1, at}, where source
                            is "input", "transcript" or "newest" and path is null for "input".
   PostToolUse ExitPlanMode deletes the pending record. If it recorded a path, that file is re-read and re-linted
@@ -44,7 +63,7 @@ Gates (main session only; a payload with agent_id is a subagent and is never gat
                            "writes"} (plus "dispatch": false where applicable), TaskUpdate addBlockedBy per edge
                            (plan ids, "D <- A, B"), then dispatch the level-0 tasks in ONE message, one Agent call
                            each, description ending '· #<id>'. Dependency levels and the critical path length are
-                           listed too.
+                           listed too, then a "Files changed:" tree generated from the writes.
   PreToolUse Agent|Task    when plan.json exists, the plan is active (see Retire) and the subagent type is gated
                            (not web-fetch, claude-code-guide, Explore, Plan, opus-reviewer, pr-reviewer-*, diagnoser-*): denied
                            when a plan task has no live task entry (metadata.plan_key and plan_id), when a plan
@@ -76,7 +95,8 @@ exception allows silently. Deny output goes to stdout as
 {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": text}}
 with exit 0; each deny appends one line to the log.
 
-Config (harness config): plan_max_writes (int, default 8), plan_ttl_sec (number, default 86400).
+Config (harness config): plan_max_writes (int, default 8), plan_ttl_sec (number, default 86400),
+plan_require_files (bool, default true; false skips every ```files check).
 Env overrides (tests): TASK_GATE_STATE_DIR, PLAN_GATE_PLANS_DIR, PLAN_GATE_LOG, CLAUDE_HARNESS_CONFIG.
 """
 import fnmatch, hashlib, json, os, re, sys, tempfile, time
@@ -106,6 +126,15 @@ EXAMPLE = '''```tasks
    "needs": {"A": "the tests import the parser module"}},
   {"id": "C", "subject": "Document the parser", "writes": ["docs/parser.md"]}
 ]}
+```
+
+```files
+src/
+  parser.py          [A]  new
+tests/
+  test_parser.py     [B]  new
+docs/
+  parser.md          [C]  edit
 ```'''
 
 
@@ -171,6 +200,11 @@ def plan_ttl():
     if is_num(v) and v > 0:
         return float(v)
     return float(DEFAULT_PLAN_TTL)
+
+
+def plan_require_files():
+    v = harness_value("plan_require_files")
+    return v if isinstance(v, bool) else True
 
 
 def gated_type(sub):
@@ -271,12 +305,12 @@ def plan_key(text, created):
     return sha1_hex(text + str(created))[:10]
 
 
-def fenced_blocks(text):
-    """(bodies of ```tasks fences, error or None). The info string must be exactly tasks."""
+def fenced_blocks(text, info="tasks"):
+    """(bodies of ```<info> fences, error or None). The info string must be exactly info (tasks or files)."""
     bodies, cur = [], None
     for line in text.splitlines():
         if cur is None:
-            if re.match(r"^\s*```\s*tasks\s*$", line):
+            if re.match(r"^\s*```\s*" + re.escape(info) + r"\s*$", line):
                 cur = []
         elif line.strip() == "```":
             bodies.append("\n".join(cur))
@@ -284,7 +318,7 @@ def fenced_blocks(text):
         else:
             cur.append(line)
     if cur is not None:
-        return bodies, "unterminated ```tasks block (no closing ```)"
+        return bodies, "unterminated ```%s block (no closing ```)" % info
     return bodies, None
 
 
@@ -364,6 +398,127 @@ def parse_plan(text):
     if problems:
         return None, problems
     return {"serial_reason": serial, "tasks": items}, None
+
+
+# ---- files block -----------------------------------------------------------
+
+TREE_PREFIX = re.compile(r"^[ \t│├└─|`\-]*")
+
+
+def parse_files_tree(body):
+    """(leaves, problems) of a ```files body. A leaf is {"path", "ids": set, "line"}; its path is the leaf name
+    joined to its ancestor directory names. Blank lines are skipped."""
+    leaves, problems, stack = [], [], []  # stack: (depth, directory path ending in "/"), directories only
+    for n, raw in enumerate(body.splitlines(), 1):
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        depth = TREE_PREFIX.match(line).end()
+        rest = line[depth:]
+        leaf = re.match(r"^(\S+)\s*\[([^\]]*)\]", rest)
+        dirm = None if leaf else re.match(r"^(\S+/)(?:\s|$)", rest)
+        if leaf:
+            ids = set(x for x in re.split(r"[,\s]+", leaf.group(2)) if x)
+            if not ids:
+                problems.append("files block line %d has an empty id list: %s" % (n, line.strip()))
+                continue
+        elif not dirm:
+            problems.append("files block line %d is neither a directory (name ending in /) nor a file line "
+                            "(name  [ids]  note): %s" % (n, line.strip()))
+            continue
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        parent = stack[-1][1] if stack else ""
+        if leaf:
+            leaves.append({"path": parent + leaf.group(1), "ids": ids, "line": n})
+        else:
+            stack.append((depth, parent + dirm.group(1)))
+    return leaves, problems
+
+
+def tree_problems(tasks, leaves):
+    """Problems comparing the leaves of a ```files tree with the tasks' writes (see the module docstring)."""
+    writers, first = {}, {}
+    for t in tasks:
+        for w in t["writes"]:
+            n = norm_path(w)
+            writers.setdefault(n, set()).add(t["id"])
+            first.setdefault(n, w)
+    counts = {}
+    for lf in leaves:
+        n = norm_path(lf["path"])
+        counts[n] = counts.get(n, 0) + 1
+    problems = []
+    for n, ids in writers.items():
+        if n not in counts:
+            problems.append("files block is missing %s (written by %s)"
+                            % (first[n], ", ".join("#" + x for x in sorted(ids))))
+    for lf in leaves:
+        n = norm_path(lf["path"])
+        if n not in writers:
+            problems.append("files block lists %s, which no task writes" % lf["path"])
+        elif lf["ids"] != writers[n]:
+            problems.append("files block: %s is tagged [%s] but is written by [%s]"
+                            % (lf["path"], ", ".join(sorted(lf["ids"])), ", ".join(sorted(writers[n]))))
+        if counts[n] > 1:
+            problems.append("files block lists %s more than once" % lf["path"])
+    out = []
+    for p in problems:
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def files_problems(text, tasks):
+    """Problems with the plan's ```files block against the tasks' writes ([] when it is fine)."""
+    bodies, err = fenced_blocks(text, "files")
+    if err:
+        return [err]
+    any_writes = any(t["writes"] for t in tasks)
+    if not bodies:
+        return ["no ```files block in the plan"] if any_writes else []
+    if len(bodies) > 1:
+        return ["the plan has %d ```files blocks; keep exactly one" % len(bodies)]
+    if not any_writes:
+        if any(line.strip() for line in bodies[0].splitlines()):
+            return ["no task writes a file, so the ```files block must have no file lines"]
+        return []
+    leaves, problems = parse_files_tree(bodies[0])
+    return problems + tree_problems(tasks, leaves)
+
+
+def render_files_tree(tasks):
+    """The ```files tree generated from the tasks' writes: sorted, two spaces per level, shared directories
+    merged, each leaf tagged with its sorted task ids. Parses back with parse_files_tree."""
+    root = {}
+    for t in tasks:
+        for w in t["writes"]:
+            p = w.replace("\\", "/")
+            while p.startswith("./"):
+                p = p[2:]
+            parts = [x for x in p.split("/") if x]
+            level = root
+            for i, seg in enumerate(parts):
+                node = level.setdefault(seg.lower(), {"name": seg, "ids": set(), "dir": False, "kids": {}})
+                if i == len(parts) - 1:
+                    node["ids"].add(t["id"])
+                    node["dir"] = node["dir"] or p.endswith("/")
+                level = node["kids"]
+    lines = []
+
+    def emit(level, depth):
+        for key in sorted(level):
+            node = level[key]
+            pad = "  " * depth
+            if node["ids"]:
+                lines.append("%s%s%s  [%s]" % (pad, node["name"], "/" if node["dir"] else "",
+                                               ", ".join(sorted(node["ids"]))))
+            if node["kids"]:
+                lines.append("%s%s/" % (pad, node["name"]))
+                emit(node["kids"], depth + 1)
+
+    emit(root, 0)
+    return "\n".join(lines)
 
 
 # ---- graph -----------------------------------------------------------------
@@ -462,19 +617,27 @@ def lint(text):
         problems.append("the plan is a pure chain of %d dispatchable tasks (dispatchable critical path %d) with no "
                         "serial_reason; make independent tasks free of needs and overlapping writes, or add "
                         '"serial_reason" explaining why the work must be serial' % (len(dispatch), crit))
+    if plan_require_files():
+        problems += files_problems(text, tasks)
     return doc, blockers, problems
 
 
-def plan_reason(problems):
-    return ("ExitPlanMode blocked: the plan's ```tasks block needs fixing before you leave plan mode:\n- "
+def plan_reason(problems, expected=None):
+    text = ("ExitPlanMode blocked: the plan's ```tasks / ```files blocks need fixing before you leave plan mode:\n- "
             + "\n- ".join(problems)
             + '\nFix: keep exactly one ```tasks fenced block holding a JSON array of tasks, or an object '
               '{"serial_reason": "...", "tasks": [...]}. Each task has id, subject, writes (list, may be []), '
-              'optional needs {"other_id": "reason"} and optional dispatch (bool). Example:\n' + EXAMPLE)
+              'optional needs {"other_id": "reason"} and optional dispatch (bool). Keep exactly one ```files fenced '
+              'block: a directory tree of every file the tasks write, each file line tagged with its task ids, '
+              'matching the writes exactly. Example:\n' + EXAMPLE)
+    if expected is not None:
+        text += ("\nExpected ```files block (generated from writes; paste it and add notes):\n```files\n"
+                 + expected + "\n```")
+    return text
 
 
 NO_PLAN = ("ExitPlanMode blocked: there is no plan text (tool_input.plan is empty, the transcript names no plan "
-           "file, and PLANS_DIR has no *.md plan). Write the plan with exactly one ```tasks block, then exit plan "
+           "file, and PLANS_DIR has no *.md plan). Write the plan with exactly one ```tasks block and one ```files block, then exit plan "
            "mode. Example:\n" + EXAMPLE)
 
 
@@ -748,13 +911,14 @@ def context_text(doc, blockers, key):
     now = [t["id"] for t in tasks if depth[t["id"]] == 1 and t["dispatch"]]
     now_txt = ", ".join(now) if now else "none"
     dispatchable = sum(1 for t in tasks if t["dispatch"])
-    return ("Plan DAG recorded (plan key %s): %d tasks (%d dispatchable), critical path length %d (counting all "
+    dag = ("Plan DAG recorded (plan key %s): %d tasks (%d dispatchable), critical path length %d (counting all "
             "tasks). Dependency levels (level 0 = no blockers; tasks with dispatch false are not dispatched): %s. "
             'Steps, in order: (1) TaskCreate each task with metadata {"plan_key": "%s", "plan_id": "<id>", '
             '"writes": [...]} (dispatch:false tasks also get "dispatch": false); (2) TaskUpdate addBlockedBy for '
             "each edge, listed as plan ids: %s; (3) dispatch every task with no blockers in ONE message, one Agent "
             "call each, description ending '· #<task id>': now %s."
             % (key, len(tasks), dispatchable, max(depth.values(), default=0), lvl, key, edges, now_txt))
+    return dag + "\n\nFiles changed:\n" + (render_files_tree(tasks) or "(none)")
 
 
 # ---- gates -----------------------------------------------------------------
@@ -781,8 +945,13 @@ def exit_check(ti, tp):
     text, path, source = resolve_plan(ti, tp)
     if text is None:
         return NO_PLAN, None, None, None
-    _, _, problems = lint(text)
-    return (plan_reason(problems) if problems else None), text, path, source
+    doc, blockers, problems = lint(text)
+    if not problems:
+        return None, text, path, source
+    expected = None
+    if doc is not None and blockers is not None and plan_require_files() and files_problems(text, doc["tasks"]):
+        expected = render_files_tree(doc["tasks"])
+    return plan_reason(problems, expected), text, path, source
 
 
 def post_exit(sid, ti, tp):
