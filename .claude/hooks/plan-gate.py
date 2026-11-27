@@ -14,17 +14,24 @@ tasks, or an object {"serial_reason": str (optional), "tasks": [...]}. A task:
   writes    list of path/glob strings (may be [])
   needs     optional object {other_id: non-empty reason string}
   dispatch  optional bool, default true (false: the caller's or the user's own task, never an executor's)
-The plan must also contain exactly one ```files block: a directory tree of every file the tasks write, laid out as
-in the project. It is optional only when no task writes anything, and then it must have no file lines. Format:
-  directory line  a name ending in "/" with no [ids] list; the name may hold several segments ("src/parser/");
-                  text after the name is a note and is ignored
-  file line       <name>  [<ids>]  <note>; <ids> is a comma and/or space separated list of task ids. The name may
-                  hold "/", be a glob ("*.sql"), or be a directory written as one write entry ("docs/  [C]": a
-                  name ending in "/" WITH an id list is a leaf)
-  box-drawing prefixes (│, ├──, └──, |--, `--) and spaces are indentation; depth is the column where the name
-  starts, and a line's parent is the nearest earlier directory line with a smaller depth.
-The full path of a leaf is its ancestor directory names joined with its name. Blank lines are ignored. Any other
-line shape is a problem naming the line number. Checks, comparing normalised paths (norm_path):
+The plan must contain exactly one ```files block whenever any task writes something: a directory tree of every file
+the tasks write, laid out as in the project. When every task's writes is [], the block is optional, and if present it
+may hold directory lines only (no file lines). Format:
+  directory line  a name ending in "/" with no [ids] list; the name may hold several segments ("src/parser/") and
+                  spaces; text after the name is a note and is ignored
+  file line       <name>  [<ids>]  <note>; whitespace is REQUIRED before "[", and <ids> is a comma and/or space
+                  separated list of task ids, never empty. The name may hold "/", spaces, brackets ("x[1].py"), or be
+                  a glob ("*.sql"), or a directory written as one write entry ("docs/  [C]": a name ending in "/"
+                  WITH an id list is a leaf)
+  indentation     leading spaces, tree connectors (│, ├──, └──, |--, `--, each followed by a space) and a bare │ or
+                  | followed by spaces. Depth is the column where the name starts; a line's parent is the nearest
+                  earlier directory line with a smaller depth. A tab in the indentation is a problem, and so is a
+                  line indented deeper than the file line just before it.
+  top-level leaf  a write that cannot be drawn as nested lines (absolute, containing "//", or with a segment that
+                  would not survive parsing) is one top-level file line holding its full path, e.g. "/abs/x.py  [A]"
+The full path of a leaf is its ancestor directory names joined with its name (a leaf with no ancestors keeps its
+name verbatim). Blank lines are ignored. Any other line shape is a problem naming the line number. Checks, comparing
+normalised paths (norm_path):
   every task write must appear as a leaf    "files block is missing <path> (written by #A)"
   every leaf must equal some write          "files block lists <path>, which no task writes"
   a leaf's id set must equal exactly the tasks whose writes contain it
@@ -333,6 +340,10 @@ def validate_tasks(raw):
         if not isinstance(tid, str) or not tid.strip():
             problems.append("task #%d: id must be a non-empty string" % i)
             continue
+        if re.search(r"[\s,\[\]]", tid):
+            problems.append('task "%s": id must not contain spaces, commas or square brackets (the ```files block '
+                            "tags leaves with ids)" % tid)
+            continue
         label = 'task "%s"' % tid
         if any(x["id"] == tid for x in items):
             problems.append('duplicate id "%s"' % tid)
@@ -343,6 +354,12 @@ def validate_tasks(raw):
         if not isinstance(writes, list) or not all(isinstance(w, str) and w.strip() for w in writes):
             problems.append('%s: writes must be a list of non-empty path strings (use [] for none)' % label)
             writes = []
+        else:
+            bad = [w for w in writes if not write_renderable(w)]
+            if bad:
+                problems.append('%s: write %s cannot be written in a ```files block (no leading or trailing spaces, '
+                                'tabs or line breaks, and no leading "| " or "├── " style connector); rename it'
+                                % (label, json.dumps(bad[0], ensure_ascii=False)))
         needs = t.get("needs")
         if needs is None:
             needs = {}
@@ -402,37 +419,79 @@ def parse_plan(text):
 
 # ---- files block -----------------------------------------------------------
 
-TREE_PREFIX = re.compile(r"^[ \t│├└─|`\-]*")
+LEAF_LINE = re.compile(r"^(.*\S)\s+\[([^\[\]]*)\]\s*(.*)$")
+DIR_LINE = re.compile(r"^(.*?/)(?:\s.*)?$")
+TREE_CONNECTORS = ("├── ", "└── ", "|-- ", "`-- ")
+
+
+def name_start(line):
+    """Column where a tree line's name starts: after leading spaces, tree connectors (each with its space) and
+    bare vertical rules (│ or | followed by a space). None when a tab sits in the indentation."""
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == " ":
+            i += 1
+        elif c == "\t":
+            return None
+        elif line.startswith(TREE_CONNECTORS, i):
+            i += 4
+        elif c in "│|" and line[i + 1:i + 2] == " ":
+            i += 1
+        else:
+            break
+    return i
+
+
+def read_tree_line(line):
+    """(depth, kind, name, ids, problem) of one non-blank line with no trailing spaces. kind is "leaf" (name [ids];
+    the name keeps any "/") or "dir" (name ending in "/"). problem is None, or "tab", "empty" or "shape"."""
+    depth = name_start(line)
+    if depth is None:
+        return None, None, None, None, "tab"
+    rest = line[depth:]
+    leaf = LEAF_LINE.match(rest)
+    if leaf:
+        ids = set(x for x in re.split(r"[,\s]+", leaf.group(2)) if x)
+        if not ids:
+            return depth, None, None, None, "empty"
+        return depth, "leaf", leaf.group(1), ids, None
+    d = DIR_LINE.match(rest)
+    if d:
+        return depth, "dir", d.group(1), None, None
+    return depth, None, None, None, "shape"
 
 
 def parse_files_tree(body):
-    """(leaves, problems) of a ```files body. A leaf is {"path", "ids": set, "line"}; its path is the leaf name
-    joined to its ancestor directory names. Blank lines are skipped."""
+    """(leaves, problems) of a ```files body. A leaf is {"path", "ids": set, "line"}; its path is the leaf name joined
+    to its ancestor directory names (a leaf with no ancestors keeps its name verbatim). Blank lines are skipped."""
     leaves, problems, stack = [], [], []  # stack: (depth, directory path ending in "/"), directories only
+    file_depth = None  # depth of the previous line when that line was a valid file line
     for n, raw in enumerate(body.splitlines(), 1):
         line = raw.rstrip()
         if not line.strip():
             continue
-        depth = TREE_PREFIX.match(line).end()
-        rest = line[depth:]
-        leaf = re.match(r"^(\S+)\s*\[([^\]]*)\]", rest)
-        dirm = None if leaf else re.match(r"^(\S+/)(?:\s|$)", rest)
-        if leaf:
-            ids = set(x for x in re.split(r"[,\s]+", leaf.group(2)) if x)
-            if not ids:
-                problems.append("files block line %d has an empty id list: %s" % (n, line.strip()))
-                continue
-        elif not dirm:
+        depth, kind, name, ids, problem = read_tree_line(line)
+        this_file = None
+        if problem == "tab":
+            problems.append("files block line %d: use spaces, not tabs, in the ```files block" % n)
+        elif problem == "empty":
+            problems.append("files block line %d has an empty id list: %s" % (n, line.strip()))
+        elif problem:
             problems.append("files block line %d is neither a directory (name ending in /) nor a file line "
                             "(name  [ids]  note): %s" % (n, line.strip()))
-            continue
-        while stack and stack[-1][0] >= depth:
-            stack.pop()
-        parent = stack[-1][1] if stack else ""
-        if leaf:
-            leaves.append({"path": parent + leaf.group(1), "ids": ids, "line": n})
+        elif file_depth is not None and depth > file_depth:
+            problems.append("files block line %d is indented under a file line: %s" % (n, line.strip()))
         else:
-            stack.append((depth, parent + dirm.group(1)))
+            while stack and stack[-1][0] >= depth:
+                stack.pop()
+            parent = stack[-1][1] if stack else ""
+            if kind == "leaf":
+                leaves.append({"path": parent + name, "ids": ids, "line": n})
+                this_file = depth
+            else:
+                stack.append((depth, parent + name))
+        file_depth = this_file
     return leaves, problems
 
 
@@ -470,7 +529,8 @@ def tree_problems(tasks, leaves):
 
 
 def files_problems(text, tasks):
-    """Problems with the plan's ```files block against the tasks' writes ([] when it is fine)."""
+    """Problems with the plan's ```files block against the tasks' writes ([] when it is fine). With no writes at all,
+    a block of directory lines (or an empty one) passes; only file lines are a problem."""
     bodies, err = fenced_blocks(text, "files")
     if err:
         return [err]
@@ -479,31 +539,71 @@ def files_problems(text, tasks):
         return ["no ```files block in the plan"] if any_writes else []
     if len(bodies) > 1:
         return ["the plan has %d ```files blocks; keep exactly one" % len(bodies)]
-    if not any_writes:
-        if any(line.strip() for line in bodies[0].splitlines()):
-            return ["no task writes a file, so the ```files block must have no file lines"]
-        return []
     leaves, problems = parse_files_tree(bodies[0])
+    if not any_writes:
+        if leaves:
+            return ["no task writes a file, so the ```files block must have no file lines"]
+        return problems
     return problems + tree_problems(tasks, leaves)
 
 
+def tree_segments(w):
+    """(segments, is_dir) when write w can be drawn as a nested tree leaf: its normalised path has no leading "/" and
+    no "//", and every segment survives parsing both as a directory line and as a leaf name. Else None."""
+    p = w.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    is_dir = p.endswith("/")
+    segs = (p[:-1] if is_dir else p).split("/")
+    if p.startswith("/") or "//" in p or not all(segs):
+        return None
+    for i, seg in enumerate(segs):
+        if read_tree_line(seg + "/")[1:3] != ("dir", seg + "/"):
+            return None
+        if i == len(segs) - 1:
+            name = seg + "/" if is_dir else seg
+            if read_tree_line(name + "  [A]")[1:3] != ("leaf", name):
+                return None
+    return segs, is_dir
+
+
+def write_renderable(w):
+    """True when write w can appear in a ```files block: as a nested tree leaf, or else as one top-level leaf line
+    whose name is w itself (absolute paths, "//", segments that would not survive parsing)."""
+    if w.splitlines() != [w]:
+        return False
+    if tree_segments(w) is not None:
+        return True
+    return read_tree_line(w + "  [A]")[1:3] == ("leaf", w)
+
+
 def render_files_tree(tasks):
-    """The ```files tree generated from the tasks' writes: sorted, two spaces per level, shared directories
-    merged, each leaf tagged with its sorted task ids. Parses back with parse_files_tree."""
-    root = {}
+    """The ```files block generated from the tasks' writes. Writes are grouped by norm_path. A group becomes a leaf in
+    the nested tree (directories merged, sorted by name, two spaces per level) when one of its spellings can be drawn
+    there; otherwise it is one top-level leaf line holding the written path verbatim. Each leaf is tagged with its
+    sorted task ids. parse_files_tree reads the result back to the same leaves."""
+    groups = {}
     for t in tasks:
         for w in t["writes"]:
-            p = w.replace("\\", "/")
-            while p.startswith("./"):
-                p = p[2:]
-            parts = [x for x in p.split("/") if x]
-            level = root
-            for i, seg in enumerate(parts):
-                node = level.setdefault(seg.lower(), {"name": seg, "ids": set(), "dir": False, "kids": {}})
-                if i == len(parts) - 1:
-                    node["ids"].add(t["id"])
-                    node["dir"] = node["dir"] or p.endswith("/")
-                level = node["kids"]
+            g = groups.setdefault(norm_path(w), {"ids": set(), "spellings": []})
+            g["ids"].add(t["id"])
+            g["spellings"].append(w)
+    root, top = {}, []
+    for key in sorted(groups):
+        g = groups[key]
+        drawn = [(w, tree_segments(w)) for w in g["spellings"]]
+        drawn = [d for d in drawn if d[1] is not None]
+        if not drawn:
+            top.append("%s  [%s]" % (g["spellings"][0], ", ".join(sorted(g["ids"]))))
+            continue
+        segs, is_dir = drawn[0][1]
+        level = root
+        for i, seg in enumerate(segs):
+            node = level.setdefault(seg.lower(), {"name": seg, "ids": set(), "dir": False, "kids": {}})
+            if i == len(segs) - 1:
+                node["ids"] |= g["ids"]
+                node["dir"] = is_dir
+            level = node["kids"]
     lines = []
 
     def emit(level, depth):
@@ -518,7 +618,7 @@ def render_files_tree(tasks):
                 emit(node["kids"], depth + 1)
 
     emit(root, 0)
-    return "\n".join(lines)
+    return "\n".join(lines + top)
 
 
 # ---- graph -----------------------------------------------------------------

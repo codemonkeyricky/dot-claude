@@ -755,3 +755,88 @@ def test_71_post_context_lists_files_changed(hook):
 def test_72_no_plan_text_message_shows_files_block(hook):
     out = hook.exit_plan(None)
     assert "```files" in reason(out)
+
+
+def assert_round_trip(mod, tasks):
+    """The rendered tree parses back to exactly the writes and ids, and pasting it into a plan lints clean."""
+    rendered = mod.render_files_tree(tasks)
+    leaves, problems = mod.parse_files_tree(rendered)
+    assert problems == []
+    expect = {}
+    for t in tasks:
+        for w in t["writes"]:
+            expect.setdefault(w, set()).add(t["id"])
+    got = sorted((lf["path"], tuple(sorted(lf["ids"]))) for lf in leaves)
+    assert got == sorted((w, tuple(sorted(ids))) for w, ids in expect.items())
+    text = plan_with({"tasks": tasks}, rendered)
+    assert mod.files_problems(text, tasks) == []
+    assert mod.lint(text)[2] == []
+    return rendered
+
+
+def test_73_awkward_writes_round_trip_across_tasks(hook):
+    mod = load_gate()
+    tasks = [task("A", ["/abs/x.py", "a//b.py", "-notes.md", "|odd.md", "src/p.py"]),
+             task("B", ["my docs/a.md", "x[1].py", "src/q.py", "src/p.py"]),
+             task("C", ["db/*.sql", "docs/", "src/sub/r.py", "|odd.md"])]
+    rendered = assert_round_trip(mod, tasks)
+    assert "/abs/x.py  [A]" in rendered.splitlines()
+
+
+def test_74_plan_gate_example_paths_round_trip(hook):
+    mod = load_gate()
+    tasks = [task("A", ["/abs/x.py", "a//b.py", "-notes.md", "my docs/a.md", "src/p.py"])]
+    assert_round_trip(mod, tasks)
+
+
+def test_75_single_awkward_write_kinds_each_round_trip(hook):
+    mod = load_gate()
+    for w in ["/abs/x.py", "a//b.py", "-notes.md", "|odd.md", "my docs/a.md", "x[1].py", "db/*.sql", "docs/"]:
+        assert_round_trip(mod, [task("A", [w])])
+
+
+def test_76_strict_connectors_keep_names_and_leaf_needs_space(hook):
+    mod = load_gate()
+    obj = {"tasks": [task("A", ["src/-notes.md", "src/|odd.md"])]}
+    assert mod.files_problems(plan_with(obj, "src/\n  -notes.md  [A]\n  |odd.md  [A]"), obj["tasks"]) == []
+    leaves, problems = mod.parse_files_tree("a.py[A]")
+    assert leaves == [] and "neither a directory" in problems[0]
+
+
+def test_77_tab_indentation_denied(hook):
+    out = hook.exit_plan(plan_with(wide_plan(), "src/\n\ta.py  [A]\n  b.py  [B]\ndocs/\n  c.md  [C]"))
+    assert decision(out) == "deny"
+    assert "files block line 2: use spaces, not tabs, in the ```files block" in reason(out)
+
+
+def test_78_empty_id_list_denied(hook):
+    out = hook.exit_plan(plan_with(wide_plan(), "src/\n  a.py  []\n  b.py  [B]\ndocs/\n  c.md  [C]"))
+    assert decision(out) == "deny"
+    assert "files block line 2 has an empty id list" in reason(out)
+
+
+def test_79_unterminated_files_fence_denied(hook):
+    text = "# Plan\n\n```tasks\n" + json.dumps(wide_plan()) + "\n```\n\n```files\nsrc/\n  a.py  [A]\n"
+    out = hook.exit_plan(text)
+    assert decision(out) == "deny"
+    assert "unterminated ```files block" in reason(out)
+
+
+def test_80_file_line_then_deeper_line_is_indented_under_file(hook):
+    obj = {"tasks": [task("A", ["src/a.py"]), task("B", ["src/b.py"])]}
+    out = hook.exit_plan(plan_with(obj, "src/\na.py  [A]\n  b.py  [B]"))
+    assert decision(out) == "deny"
+    assert "files block line 3 is indented under a file line" in reason(out)
+    assert "files block lists b.py" not in reason(out)
+
+
+def test_81_dirs_only_block_with_empty_writes_passes(hook):
+    obj = {"tasks": [task("A"), task("B")]}
+    assert hook.exit_plan(plan_with(obj, "src/\n  docs/\n  lib/")) == ""
+    assert hook.exit_plan(plan_with(obj, "")) == ""
+
+
+def test_82_write_that_cannot_be_rendered_rejected_at_parse(hook):
+    out = hook.exit_plan(plan_md({"tasks": [task("A", [" lead.py"])]}))
+    assert decision(out) == "deny"
+    assert "cannot be written in a ```files block" in reason(out)
