@@ -1,0 +1,42 @@
+{
+  "pool_size": 8,
+  "running_stale_sec": 3600,
+  "executors": [
+    "qorvax-tel",
+    "zyrene-vosk",
+    "thal-ummir",
+    "kreeva-osh",
+    "vexlor-ain",
+    "nyxa-prell",
+    "oomrak-zhee",
+    "xilth-varo",
+    "juun-ketrax",
+    "plimm-oraxi"
+  ],
+  "plan_max_writes": 8,
+  "plan_ttl_sec": 86400,
+  "require_background": true,
+  "agent_budget": {
+    "default": {"soft": 150, "hard": 200},
+    "types": {
+      "pr-reviewer-*": {"soft": 80, "hard": 110},
+      "opus-reviewer": {"soft": 80, "hard": 110}
+    }
+  },
+  "model_gate": {
+    "allow_types": [],
+    "sonnet_fallback": false,
+    "escalate_to": ["sonnet"],
+    "max_rounds": 3
+  },
+  "diagnose_gate": {
+    "max_per_task": 2,
+    "max_per_session": 4
+  },
+  "main_allow_commands": [],
+  "readonly_scripts": [],
+  "subagent_allow_commands": [],
+  "exempt_env": {
+    "CLAUDE_LOCAL": ["1"]
+  }
+}

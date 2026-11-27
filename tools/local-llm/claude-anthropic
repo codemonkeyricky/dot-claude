@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Run plain Claude Code against the Anthropic subscription, after stopping any leftover local-mode processes.
+# Usage: claude-anthropic [claude args...]
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=config.sh
+source "$DIR/config.sh"
+STATE_DIR="${LOCAL_LLM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-local}"
+mkdir -p "$STATE_DIR"
+MODE_FILE="$STATE_DIR/.mode"
+KILL="$DIR/claude-kill-bg.sh"
+n="$("$KILL" --stale-for anthropic --count)"
+if [[ "$n" -gt 0 ]]; then
+  echo "found $n stale daemon-tree Claude process(es) (daemon not in anthropic mode)" >&2
+  case "${CLAUDE_LOCAL_KILL:-ask}" in
+    yes) "$KILL" --stale-for anthropic --yes || true ;;
+    no) echo "skipping background-process cleanup (CLAUDE_LOCAL_KILL=no)" >&2 ;;
+    *) "$KILL" --stale-for anthropic || echo "background Claude processes left running" >&2 ;;
+  esac
+fi
+echo anthropic >"$MODE_FILE"  # informational only; the cleanup no longer depends on it
+
+unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL \
+      ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+      ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL \
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC DISABLE_TELEMETRY
+# Router variables and the dispatch header must not reach a plain session.
+unset CLAUDE_ROUTER LOCAL_DISPATCH CLAUDE_ROUTE_ACTIVE
+strip_dispatch_header
+
+exec claude "$@"

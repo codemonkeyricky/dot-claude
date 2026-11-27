@@ -1,0 +1,24 @@
+# systemd user unit template for the Claude router (hybrid-proxy.py). Optional.
+# Install (replace the ExecStart path with this checkout's absolute path first):
+#   mkdir -p ~/.config/systemd/user ~/.local/state/claude-local
+#   cp tools/local-llm/hybrid-proxy.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hybrid-proxy
+# hybrid-proxy.sh up|down|status then defer to the unit (it sets HYBRID_UNIT to empty to ignore it).
+[Unit]
+Description=Claude Code router (hybrid-proxy.py) on 127.0.0.1:4000
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=/usr/bin/python3 -I /REPLACE/WITH/CHECKOUT/tools/local-llm/hybrid-proxy.py
+Environment=LOCAL_LLM_MODEL=qwen3.8:27b
+Environment=OLLAMA_HOST=127.0.0.1:11434
+Environment=HYBRID_PORT=4000
+StandardOutput=append:%h/.local/state/claude-local/hybrid-proxy.log
+StandardError=append:%h/.local/state/claude-local/hybrid-proxy.log
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

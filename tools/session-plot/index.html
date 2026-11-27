@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Session Forks</title>
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --fg: #1d1f23;
+    --muted: #6b7079;
+    --grid: #e4e2dc;
+    --panel: #ffffff;
+    --main: #1f5fbf;
+    --executor: #0f8a6b;
+    --reviewer: #b4572a;
+    --skill: #8a4fc4;
+    --other: #7a7f87;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15171b;
+      --fg: #e8e9ec;
+      --muted: #9097a1;
+      --grid: #2c3038;
+      --panel: #1d2026;
+      --main: #6aa7ff;
+      --executor: #3fd1a6;
+      --reviewer: #ff9a62;
+      --skill: #c895ff;
+      --other: #a5abb5;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15171b;
+    --fg: #e8e9ec;
+    --muted: #9097a1;
+    --grid: #2c3038;
+    --panel: #1d2026;
+    --main: #6aa7ff;
+    --executor: #3fd1a6;
+    --reviewer: #ff9a62;
+    --skill: #c895ff;
+    --other: #a5abb5;
+  }
+
+  [hidden] { display: none !important; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 16px; min-width: 0; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  h2 { font-size: 15px; margin: 18px 0 6px; }
+  .muted { color: var(--muted); }
+  #picker { margin: 8px 0; }
+  #picker select { font: inherit; max-width: 100%; padding: 4px 6px; background: var(--panel); color: var(--fg); border: 1px solid var(--grid); border-radius: 4px; }
+  #subtitle { margin: 2px 0; word-break: break-word; }
+  .titlerow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .titlerow h1 { margin-bottom: 0; }
+  .livebadge { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--executor); color: var(--bg); }
+  .livebadge.off { background: var(--grid); color: var(--muted); }
+  .livelink { font-size: 13px; }
+  .livelink a { color: var(--main); }
+  #status { margin: 2px 0 8px; font-size: 13px; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 6px 0 4px; font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex: 0 0 auto; }
+
+  .chart { width: 100%; min-width: 0; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: hidden; }
+  .chart .ptitle { font-size: 13px; font-weight: 600; fill: var(--fg); }
+  .chart .tick { font-size: 11px; fill: var(--muted); }
+  .chart .grid { stroke: var(--grid); stroke-width: 1; }
+  .chart .compact { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; }
+  .chart .ctag { font-size: 10px; fill: var(--muted); }
+  .chart polyline { fill: none; stroke-linejoin: round; stroke-linecap: round; }
+  .chart .hit { stroke: transparent; stroke-width: 10; pointer-events: stroke; }
+  .chart .conn { stroke-width: 1; stroke-dasharray: 2 2; }
+  .chart .costline { stroke-width: 1.75; }
+  .chart .br { fill: none; stroke-width: 1.5; stroke-linecap: round; }
+  .chart .trunk { stroke-width: 2.5; stroke-linecap: round; }
+  .chart path { fill: none; }
+  .chart .bar { cursor: default; }
+  .chart .lbl { font-size: 10.5px; fill: var(--fg); }
+  .chart .lbl.in { fill: var(--bg); }
+  .chart [data-sid] { transition: opacity 0.12s; }
+  .chart [data-sid].dim { opacity: 0.25; }
+
+  .tablewrap { width: 100%; overflow-x: auto; margin-top: 8px; }
+  table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  td.mono { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3) { white-space: nowrap; }
+  td:first-child { word-break: break-word; min-width: 180px; }
+  tbody tr[data-sid] { transition: background 0.12s; }
+  tbody tr.hi { background: var(--grid); }
+
+  .tip {
+    position: fixed; top: 0; left: 0; z-index: 10; pointer-events: none;
+    max-width: min(340px, calc(100vw - 32px));
+    background: var(--panel); color: var(--fg);
+    border: 1px solid var(--grid); border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; line-height: 1.45;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+    word-break: break-word;
+  }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <div class="titlerow">
+      <h1>Session Forks</h1>
+      <span id="livebadge" class="livebadge" hidden>live</span>
+      <span id="livelink" class="livelink"><a href="/live">Live →</a></span>
+    </div>
+    <div id="picker"><label>Session <select id="session"></select></label></div>
+    <p id="subtitle" class="muted"></p>
+    <p id="status" class="muted"></p>
+  </header>
+
+  <div id="legend" class="legend"></div>
+  <section id="chart" class="chart" aria-label="Context size and subagent forks over time"></section>
+
+  <h2>Series</h2>
+  <div id="table" class="tablewrap"></div>
+</main>
+<div id="tip" class="tip" role="tooltip" hidden></div>
+<script type="module" src="/main.js"></script>
+</body>
+</html>

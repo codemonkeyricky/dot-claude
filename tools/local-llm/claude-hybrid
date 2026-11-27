@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Run Claude Code as a LOCAL_DISPATCH session through the router. Same as `LOCAL_DISPATCH=1 claude-route`.
+# The router sends a request to the local Ollama model only when it carries `x-local-dispatch: 1` AND its model is a
+# Haiku model (executors and Claude Code's small background calls). Everything else, including the main session on
+# Opus or Sonnet, passes to Anthropic unchanged (Max-plan OAuth). Usage: claude-hybrid [claude args...]
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=config.sh
+source "$DIR/config.sh"
+
+if [[ ! "$HYBRID_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || (( HYBRID_PORT > 65535 )); then
+  echo "HYBRID_PORT must be a port number from 1 to 65535, got: $HYBRID_PORT" >&2
+  exit 2
+fi
+
+export LOCAL_DISPATCH=1
+exec "$DIR/claude-route" "$@"

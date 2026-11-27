@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Run Claude Code with every model request on the local Ollama model, through the router. Same as `LOCAL_DISPATCH=all claude-route`.
+# The router sends a request to the local model when it carries `x-local-dispatch: all` and has a model, whether the
+# caller is the main session or a subagent, and whatever the model name. There is no Anthropic fallback: if Ollama
+# fails, the request fails with 502. The harness rules (tasks, executors, hooks) stay on. For a direct local session
+# with those rules off, use claude-local. Usage: claude-local-all [claude args...]
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=config.sh
+source "$DIR/config.sh"
+
+if [[ ! "$HYBRID_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || (( HYBRID_PORT > 65535 )); then
+  echo "HYBRID_PORT must be a port number from 1 to 65535, got: $HYBRID_PORT" >&2
+  exit 2
+fi
+
+export LOCAL_DISPATCH=all
+exec "$DIR/claude-route" "$@"

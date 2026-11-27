@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Start Claude Code through the Claude router (hybrid-proxy.py). The exports below belong to this launcher
+# process only; never put them in a settings file.
+#   CLAUDE_ROUTER=1       ANTHROPIC_BASE_URL points at the router on HYBRID_PORT (default 4000).
+#   LOCAL_DISPATCH=1|subagents  implies CLAUDE_ROUTER=1 (1 is the alias of subagents). Adds `x-local-dispatch: subagents`
+#                         to ANTHROPIC_CUSTOM_HEADERS. The router then sends Haiku requests to Ollama; everything else
+#                         still goes to Anthropic.
+#   LOCAL_DISPATCH=all    implies CLAUDE_ROUTER=1. Adds `x-local-dispatch: all`. The router then sends every model request
+#                         (main session and subagents, any model name) to Ollama, with no Anthropic fallback.
+#   Empty or 0 is off. Any other value is off too, with a warning.
+# With none of these set, claude runs unchanged. Usage: claude-route [claude args...]
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=config.sh
+source "$DIR/config.sh"
+
+# type -P skips shell functions, so a claude shell shim cannot re-enter this script.
+CLAUDE_BIN="$(type -P claude || true)"
+if [[ -z "$CLAUDE_BIN" ]]; then echo "claude not found on PATH" >&2; exit 127; fi
+
+# Normalise LOCAL_DISPATCH: 1 is the alias of subagents. Empty and 0 are off silently; other unknown values are off with a warning.
+dispatch_mode=""
+case "${LOCAL_DISPATCH:-}" in
+  ""|0) ;;
+  1|subagents) dispatch_mode=subagents ;;
+  all) dispatch_mode=all ;;
+  *) echo "LOCAL_DISPATCH must be 1, subagents or all (got: $LOCAL_DISPATCH); ignoring" >&2 ;;
+esac
+
+if [[ -z "$dispatch_mode" && "${CLAUDE_ROUTER:-}" != 1 ]]; then
+  exec "$CLAUDE_BIN" "$@"
+fi
+
+if [[ -n "$dispatch_mode" && "${CLAUDE_ROUTER:-}" != 1 ]]; then
+  echo "LOCAL_DISPATCH=${LOCAL_DISPATCH} implies CLAUDE_ROUTER=1" >&2
+fi
+if [[ ! "$HYBRID_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || (( HYBRID_PORT > 65535 )); then
+  echo "HYBRID_PORT must be a port number from 1 to 65535, got: $HYBRID_PORT" >&2
+  exit 2
+fi
+
+"$DIR/hybrid-proxy.sh" up --quiet
+
+export CLAUDE_ROUTER=1
+export ANTHROPIC_BASE_URL="$HYBRID_URL"
+export CLAUDE_ROUTE_ACTIVE=1  # guard for the claude shim: never re-enter claude-route
+
+if [[ -n "$dispatch_mode" ]]; then
+  export LOCAL_DISPATCH="$dispatch_mode"
+  # Any old dispatch line is replaced, then the header goes on its own line after the other custom headers.
+  strip_dispatch_header
+  if [[ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]]; then
+    export ANTHROPIC_CUSTOM_HEADERS="$ANTHROPIC_CUSTOM_HEADERS"$'\n'"x-local-dispatch: $dispatch_mode"
+  else
+    export ANTHROPIC_CUSTOM_HEADERS="x-local-dispatch: $dispatch_mode"
+  fi
+fi
+
+exec "$CLAUDE_BIN" "$@"

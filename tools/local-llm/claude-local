@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Run Claude Code against the local Ollama model. Normal `claude` is not affected.
+# Usage: claude-local [claude args...]
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=config.sh
+source "$DIR/config.sh"
+
+# Validate before anything starts: the settings JSON is built by a heredoc, so quotes and backslashes would break it.
+if [[ ! "$LOCAL_LLM_COMPACT_WINDOW" =~ ^[1-9][0-9]*$ ]]; then
+  echo "LOCAL_LLM_COMPACT_WINDOW must be a positive integer, got: $LOCAL_LLM_COMPACT_WINDOW" >&2
+  exit 2
+fi
+for v in LOCAL_LLM_MODEL OLLAMA_HOST; do
+  case "${!v}" in
+    *\"*|*\\*) echo "$v must not contain a double quote or backslash, got: ${!v}" >&2; exit 2 ;;
+  esac
+done
+
+"$DIR/ollama-up.sh" --quiet
+
+export ANTHROPIC_BASE_URL="http://$OLLAMA_HOST"
+export ANTHROPIC_AUTH_TOKEN=ollama
+export ANTHROPIC_API_KEY=""
+export ANTHROPIC_MODEL="$LOCAL_LLM_MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$LOCAL_LLM_MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$LOCAL_LLM_MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LOCAL_LLM_MODEL"
+export ANTHROPIC_SMALL_FAST_MODEL="$LOCAL_LLM_MODEL"
+export CLAUDE_CODE_SUBAGENT_MODEL="$LOCAL_LLM_MODEL"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DISABLE_TELEMETRY=1
+# Router variables from a claude-route or claude-hybrid shell must not leak into a local session.
+unset CLAUDE_ROUTER LOCAL_DISPATCH CLAUDE_ROUTE_ACTIVE
+strip_dispatch_header  # drops x-local-dispatch from ANTHROPIC_CUSTOM_HEADERS, keeps other header lines
+export CLAUDE_LOCAL=1  # local-mode.py reads this to give the work-directly context
+
+# Flag settings outrank user settings, and settings-file env beats shell env,
+# so the user's ~/.claude/settings.json (subagent model, autoCompactWindow) is overridden here.
+# The generated file lives in the state dir, not in this (git checkout) directory.
+SETTINGS="$LOCAL_LLM_STATE_DIR/claude-local.settings.json"
+SETTINGS_TMP="$SETTINGS.tmp.$$"
+cat >"$SETTINGS_TMP" <<EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "$ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN": "$ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "$LOCAL_LLM_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$LOCAL_LLM_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$LOCAL_LLM_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$LOCAL_LLM_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL": "$LOCAL_LLM_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$LOCAL_LLM_MODEL",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_TELEMETRY": "1"
+  },
+  "autoCompactWindow": $LOCAL_LLM_COMPACT_WINDOW,
+  "model": "$LOCAL_LLM_MODEL",
+  "modelSettings": {
+    "$LOCAL_LLM_MODEL": {
+      "effortLevel": "high"
+    }
+  }
+}
+EOF
+if command -v jq >/dev/null 2>&1; then
+  jq empty "$SETTINGS_TMP" || { echo "generated settings are not valid JSON: $SETTINGS_TMP" >&2; rm -f "$SETTINGS_TMP"; exit 1; }
+elif command -v python3 >/dev/null 2>&1; then
+  python3 -I -c 'import json, sys; json.load(open(sys.argv[1]))' "$SETTINGS_TMP" || { echo "generated settings are not valid JSON: $SETTINGS_TMP" >&2; rm -f "$SETTINGS_TMP"; exit 1; }
+fi
+mv -f "$SETTINGS_TMP" "$SETTINGS"
+
+# Background Claude processes keep their settings, so stop daemon-tree processes started in another mode.
+# Only the daemon tree is considered (see claude-kill-bg.sh). CLAUDE_LOCAL_KILL=yes kills without asking,
+# =no skips the cleanup, unset asks (refuses without a terminal).
+MODE_FILE="$LOCAL_LLM_STATE_DIR/.mode"
+KILL="$DIR/claude-kill-bg.sh"
+n="$("$KILL" --stale-for local --count)"
+if [[ "$n" -gt 0 ]]; then
+  echo "found $n stale daemon-tree Claude process(es) (daemon not in local mode)" >&2
+  case "${CLAUDE_LOCAL_KILL:-ask}" in
+    yes) "$KILL" --stale-for local --yes || true ;;
+    no) echo "skipping background-process cleanup (CLAUDE_LOCAL_KILL=no)" >&2 ;;
+    *) "$KILL" --stale-for local || echo "background Claude processes left running" >&2 ;;
+  esac
+fi
+echo local >"$MODE_FILE"  # informational only; the cleanup no longer depends on it
+
+exec claude --settings "$SETTINGS" "$@"
