@@ -326,3 +326,24 @@ test("totals.outToday is the output tokens of today's messages, and not less tha
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a snapshot session carries a branches graph: main trunk and one branch per subagent", () => {
+  const { root, dir, file } = fixture();
+  const subDir = join(dir, SID, "subagents");
+  mkdirSync(subDir, { recursive: true });
+  writeFileSync(file, customTitleLine("Branches") + usageLine("main1", 1000));
+  writeFileSync(join(subDir, "agent-sub4.jsonl"), usageLine("sub1", 300) + usageLine("sub2", 310));
+  writeFileSync(join(subDir, "agent-sub5.jsonl"), usageLine("sub3", 320));
+  const idx = new LiveIndex(root);
+  try {
+    const s = sessionOf(idx);
+    assert.equal(s.branches.branches.length, 2, "one branch per subagent with messages");
+    assert.equal(s.branches.trunk.length, 1, "the main session is one trunk segment");
+    assert.ok(s.branches.agenticMs >= 0);
+    assert.ok(s.branches.activeMs >= s.branches.agenticMs, "active time covers agentic time");
+    assert.ok(s.branches.branches.every((b) => b.lane !== 0));
+  } finally {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

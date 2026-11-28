@@ -25,6 +25,7 @@ import {
   titleOf,
   userText,
 } from "./parse";
+import { buildLiveBranches, type BranchSource } from "./livebranches";
 import type { LiveMinute, LiveModelShare, LiveSession, LiveSnapshot, LiveSubagent, LiveTokens, TokenSplit } from "./types";
 
 const MINUTE = 60_000;
@@ -712,6 +713,25 @@ export class LiveIndex extends EventEmitter {
       }
       activeSubagents.sort((a, b) => b.lastActivity - a.lastActivity);
 
+      // Branch graph: message times (synthetic placeholders skipped) of the main session and of each subagent.
+      const timesOf = (f: FileState): number[] => {
+        const out: number[] = [];
+        for (const m of f.msgs.values()) if (!m.model.startsWith("<")) out.push(m.t);
+        return out;
+      };
+      const branchSubs: BranchSource[] = [];
+      for (const f of sess.subs.values()) {
+        if (f.agentId === null) continue;
+        branchSubs.push({
+          id: f.agentId,
+          label: f.label,
+          model: f.last?.model || undefined,
+          agentType: f.agentType,
+          times: timesOf(f),
+        });
+      }
+      const branches = buildLiveBranches(sess.main ? timesOf(sess.main) : [], branchSubs, now);
+
       const titleSrc = sess.main;
       sessions.push({
         id: sess.id,
@@ -729,6 +749,7 @@ export class LiveIndex extends EventEmitter {
         byModel: [...todayByModel.values()].sort((a, b) => b.cost - a.cost),
         subagentCount: sess.subs.size,
         activeSubagents,
+        branches,
       });
     }
 
