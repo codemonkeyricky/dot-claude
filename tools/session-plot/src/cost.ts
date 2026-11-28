@@ -109,8 +109,8 @@ export function outPerUsd(outTokens: number, usd: number): number | null {
   return outTokens / usd;
 }
 
-// Table/tooltip/status text: "—" for null, else whole number with thousands separators.
+// Table/tooltip/status text: "—" for null, else thousands with one decimal and a "k" suffix (78912 -> "78.9k").
 export function fmtOutPerUsd(v: number | null): string {
   if (v === null) return "—";
-  return Math.round(v).toLocaleString("en-US");
+  return `${(v / 1000).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}k`;
 }

@@ -12,9 +12,14 @@ test("outPerUsd divides output tokens by list-price dollars", () => {
   assert.equal(outPerUsd(Number.NaN, 1), null);
 });
 
-test("fmtOutPerUsd formats with thousands separators and dash for null", () => {
+test("fmtOutPerUsd formats in thousands with one decimal and dash for null", () => {
   assert.equal(fmtOutPerUsd(null), "—");
-  assert.equal(fmtOutPerUsd(45072.4), "45,072");
+  assert.equal(fmtOutPerUsd(45072.4), "45.1k");
+  assert.equal(fmtOutPerUsd(78912), "78.9k");
+  assert.equal(fmtOutPerUsd(45068.06), "45.1k");
+  assert.equal(fmtOutPerUsd(600), "0.6k");
+  assert.equal(fmtOutPerUsd(0), "0.0k");
+  assert.equal(fmtOutPerUsd(1234567), "1,234.6k");
 });
 
 type Rates = {

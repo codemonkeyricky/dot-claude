@@ -62,7 +62,7 @@ reload; the dev server picks up the new rates on restart. Synthetic placeholder 
 The session view shows the cost per series (table column, tooltip), the session total in
 the status line, and a "Cumulative cost" panel with lines for main, all subagents, and the
 total. The table, tooltip and status line also show output tokens per API-list-price dollar
-(Out/$); it is dominated by context re-reads (cache reads/writes), not output price, so it
+(Out/$, in thousands, e.g. 78.9k); it is dominated by context re-reads (cache reads/writes), not output price, so it
 mostly reflects context size and model mix.
 
 ## Export one session as a standalone HTML file
