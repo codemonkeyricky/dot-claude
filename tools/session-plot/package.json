@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "start": "bash scripts/start.sh",
     "export": "tsx export.ts",
     "typecheck": "tsc --noEmit",
     "check": "tsx scripts/check.ts",
