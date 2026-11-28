@@ -392,7 +392,8 @@ function renderCards(s: LiveSnapshot): void {
     cardEls.delete(id);
     cardHtmls.delete(id);
   }
-  // A toggle button with keyboard focus is replaced with its card; focus goes back to the new button.
+  // A focused subagent toggle or title link is replaced with its card; focus goes back to the
+  // matching element in the new card.
   let refocus: { id: string; sel: string } | null = null;
   // The order from the last snapshot is kept; sessions not seen before go on top (see stableOrder).
   cardOrder = stableOrder(cardOrder, s.sessions);
@@ -407,7 +408,7 @@ function renderCards(s: LiveSnapshot): void {
       cardHtmls.set(x.id, html);
     } else if (cardHtmls.get(x.id) !== html && held?.id !== x.id) {
       const active = document.activeElement as HTMLElement | null;
-      const focusSel = active && el.contains(active) && active.tagName === "BUTTON" ? focusSelectorOf(active) : null;
+      const focusSel = active && el.contains(active) && (active.tagName === "BUTTON" || active.tagName === "A") ? focusSelectorOf(active) : null;
       if (focusSel) refocus = { id: x.id, sel: focusSel };
       const fresh = parseCard(html);
       el.replaceWith(fresh);
@@ -428,13 +429,15 @@ function renderCards(s: LiveSnapshot): void {
   tick();
   if (refocus) {
     const r: { id: string; sel: string } = refocus;
-    cardEls.get(r.id)?.querySelector<HTMLButtonElement>(r.sel)?.focus({ preventScroll: true });
+    cardEls.get(r.id)?.querySelector<HTMLElement>(r.sel)?.focus({ preventScroll: true });
   }
 }
 
-// The selector that finds the same button in a rebuilt card: the subagent toggle.
-function focusSelectorOf(btn: HTMLElement): string | null {
-  return btn.classList.contains("subs-toggle") ? ".subs-toggle" : null;
+// The selector that finds the same control in a rebuilt card: the subagent toggle or the title link.
+function focusSelectorOf(el: HTMLElement): string | null {
+  if (el.classList.contains("subs-toggle")) return ".subs-toggle";
+  if (el.classList.contains("card-link")) return ".card-link";
+  return null;
 }
 
 // One stacked bar of a session's by-model split. Segments keep the server order (cost descending),
@@ -461,7 +464,8 @@ function shareBar(kind: string, total: number, totalText: string, parts: { model
 }
 
 // Branch graph for a session row. Built from the snapshot alone (its branches and the server clock
-// now), so it changes only when a snapshot arrives, never on the one-second tick.
+// rounded down to the minute, see branchesSvg), so it changes at most once a minute, never on the
+// one-second tick.
 const BR_W = 400; // viewBox width
 const BR_PITCH = 6; // px between lanes
 const BR_H = 2 * 3 * BR_PITCH + 8; // 44: three lanes each side, plus margin
@@ -528,8 +532,12 @@ function branchRatio(x: LiveSession): string {
 function branchesSvg(x: LiveSession, now: number): string {
   const b = x.branches;
   const mid = BR_H / 2;
+  // The clock is rounded down to the minute before it reaches the row HTML, so an unchanged session
+  // rebuilds at most once a minute and keeps its focus and tooltips between snapshots.
+  const axisNow = Math.floor(now / 60_000) * 60_000;
   // The axis runs to now while the session is recent, and to its last message once it is older.
-  const x1 = now - b.end < 3_600_000 ? now : b.end;
+  // The rounded clock can trail the last message by up to a minute, so the end never precedes it.
+  const x1 = axisNow - b.end < 3_600_000 ? Math.max(axisNow, b.end) : b.end;
   // Long idle gaps are compressed to a fixed-width break; every x below goes through this mapper.
   const axis = compressAxis(b, x1);
   const X = axis.x;

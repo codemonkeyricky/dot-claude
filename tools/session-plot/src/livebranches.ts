@@ -108,9 +108,9 @@ export function buildLiveBranches(
   const activeTotal = spanTotal([...trunk, ...spans]);
 
   // Turn-based share: a main turn is agentic when a subagent was running at its time. An active
-  // subagent also covers the last activeMs before now, since it has not merged back yet.
+  // subagent has not merged back yet, so it covers [fork, now] (never time before it forked).
   const turnSpans: Span[] = [...spans];
-  if (all.some((s) => s.active)) turnSpans.push([now - activeMs, now]);
+  for (const s of all) if (s.active) turnSpans.push([Math.min(s.fork, now), now]);
   const merged = mergeSpans(turnSpans);
   let agenticTurns = 0;
   for (const t of mainTimes) {

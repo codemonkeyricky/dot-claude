@@ -412,3 +412,48 @@ test("a row with branches renders the branch graph, one path per branch, and the
   assert.ok(card.querySelector(".br-head .br-ratio"), "row has the ratio bar");
   assert.equal(card.querySelector(".br-ratio")?.getAttribute("title"), "2 of 4 main turns ran while subagents were working");
 });
+
+// A recent session's branch data, relative to the clock t (the axis end follows the snapshot clock).
+function recentBranches(t: number): LiveSession["branches"] {
+  return {
+    start: t - 3_600_000,
+    end: t - 1_000,
+    trunk: [[t - 3_600_000, t - 1_000]],
+    branches: [{ id: "m-b1", label: "exec", model: "model-a", fork: t - 600_000, merge: t - 300_000, lane: 1, active: false }],
+    agenticMs: 300_000,
+    activeMs: 3_600_000,
+    maxLane: 1,
+    mainTurns: 4,
+    agenticTurns: 1,
+  };
+}
+
+test("an unchanged row keeps its DOM node and focused title link across snapshots in the same minute", async () => {
+  await loaded;
+  // Move the fake clock to one second into a fresh minute, so both snapshots share one rounded clock.
+  mock.timers.tick(Math.floor(Date.now() / 60_000) * 60_000 + 61_000 - Date.now());
+  const s = { ...session("m1", 1_000), branches: recentBranches(Date.now()) };
+  push(snapshot([s]));
+  const card = w.document.querySelector<HTMLElement>(`.card[data-id="m1"]`)!;
+  const link = card.querySelector<HTMLElement>(".card-link")!;
+  link.focus();
+  mock.timers.tick(2_000);
+  push(snapshot([s]));
+  assert.equal(w.document.querySelector<HTMLElement>(`.card[data-id="m1"]`), card, "the card node is kept");
+  assert.equal(link.isConnected, true, "the link was not replaced");
+  assert.equal(w.document.activeElement, link, "focus stays on the title link");
+});
+
+test("a focused title link is restored when its card is rebuilt", async () => {
+  await loaded;
+  const s = { ...session("m2", 1_000), branches: recentBranches(Date.now()) };
+  push(snapshot([s]));
+  const link = w.document.querySelector<HTMLElement>(`.card[data-id="m2"] .card-link`)!;
+  link.focus();
+  push(snapshot([{ ...s, title: "renamed session m2" }]));
+  assert.equal(link.isConnected, false, "the card was rebuilt");
+  const focused = w.document.activeElement as HTMLElement | null;
+  assert.equal(focused?.classList.contains("card-link"), true, "focus is on the new title link");
+  assert.equal(focused?.closest(".card")?.getAttribute("data-id"), "m2");
+  assert.equal(focused?.isConnected, true);
+});

@@ -134,9 +134,10 @@ test("a main turn exactly at a subagent's fork or merge time counts as agentic",
   assert.equal(b.agenticTurns, 2);
 });
 
-test("an active subagent covers the activeMs window before now", () => {
-  // The subagent's last message is 30 s ago, so it is active and covers [NOW-120 s, NOW].
-  const b = buildLiveBranches([NOW - 60_000, NOW - 400_000], [sub("a", [NOW - 30_000])], NOW, { activeMs: 120_000 });
+test("an active subagent covers only [fork, now], not the activeMs window before its fork", () => {
+  // The subagent forked 30 s ago and has not merged back, so it is active and covers [NOW-30 s, NOW].
+  // A main turn 60 s ago came before the fork and is talk; a main turn 10 s ago is agentic.
+  const b = buildLiveBranches([NOW - 60_000, NOW - 10_000, NOW - 400_000], [sub("a", [NOW - 30_000])], NOW, { activeMs: 120_000 });
   assert.equal(b.agenticTurns, 1);
 });
 
