@@ -15,6 +15,10 @@ npm run dev
 Then open http://127.0.0.1:4395/?session=<sessionId>. Without `?session=` the first
 session in the list is shown, and the picker switches between sessions.
 
+`npm start` (or `scripts/start.sh`) launches the server detached on 127.0.0.1:4395
+(`PORT` env overrides), logs to `~/.local/state/session-plot/server.log`, and exits 0 if
+already listening. It waits for `/live` to return HTTP 200 before exiting.
+
 ## Live monitor
 
 http://127.0.0.1:4395/live shows usage as it happens:
