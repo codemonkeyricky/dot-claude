@@ -307,3 +307,21 @@ test("a synthetic <...> placeholder is not the session's latest model or context
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("totals.outToday is the output tokens of today's messages, and not less than the last hour's", () => {
+  const { root, file } = fixture();
+  writeFileSync(file, usageLine("o1", 100) + usageLine("o2", 200));
+  const idx = new LiveIndex(root);
+  try {
+    const snap = idx.refreshNow();
+    const s = snap.sessions.find((x) => x.id === SID);
+    assert.ok(s, "session should be in the snapshot");
+    assert.equal(typeof snap.totals.outToday, "number");
+    assert.equal(snap.totals.outToday, s.tokToday.out, "the same messages as the session's today output");
+    assert.equal(snap.totals.outToday, 20, "two messages of 10 output tokens each");
+    assert.ok(snap.totals.outToday >= snap.totals.outLastHour, "today includes the last hour");
+  } finally {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

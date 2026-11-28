@@ -606,7 +606,7 @@ export class LiveIndex extends EventEmitter {
       t: winStart + i * MINUTE,
       byModel: {},
     }));
-    const totals = { costToday: 0, costLastHour: 0, outLastHour: 0 };
+    const totals = { costToday: 0, costLastHour: 0, outLastHour: 0, outToday: 0 };
     const sessions: LiveSession[] = [];
 
     for (const sess of this.sessions.values()) {
@@ -626,6 +626,7 @@ export class LiveIndex extends EventEmitter {
           if (m.t >= midnight) {
             costToday += m.usd;
             totals.costToday += m.usd;
+            totals.outToday += m.out;
             addTok(tokToday, m);
             let share = todayByModel.get(m.model);
             if (!share) {

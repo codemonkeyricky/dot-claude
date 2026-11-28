@@ -19,12 +19,14 @@ session in the list is shown, and the picker switches between sessions.
 
 http://127.0.0.1:4395/live shows usage as it happens:
 
-- Totals: $ today, $ last hour, output tokens in the last hour.
+- Totals: $ today, $ last hour, output tokens in the last hour, and out/$ today and last hour (output tokens per dollar).
 - "Cost per minute (last 60 min)": stacked by model, hover or tap a bar for its breakdown.
 - One card per session active in the last 24 h, most recent first. Sessions active in the
   last 2 minutes are marked live. Each card shows the main model, a context gauge
-  (amber above 150k, red above 185k, of 200k), $ today and $ last hour, and the active
-  subagents. Cards link to the session plot with live refresh.
+  (filled in the main model's colour; the ctx number turns amber above 150k, red above 185k,
+  of 200k), $ today, $ last hour and out/$ today, and the active subagents. Cards link to
+  the session plot with live refresh. Cards keep their order across updates: new sessions
+  appear on top, and a reload resets to most-recent-first.
 
 The session plot is live at `/?session=<id>&live=1`. It refetches the session (at most every
 3 s) when the server reports that one of its transcripts changed.

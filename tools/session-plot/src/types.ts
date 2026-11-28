@@ -105,7 +105,7 @@ export interface LiveSession {
 export interface LiveSnapshot {
   now: number; // epoch ms, server clock
   windowMin: number;
-  totals: { costToday: number; costLastHour: number; outLastHour: number };
+  totals: { costToday: number; costLastHour: number; outLastHour: number; outToday: number };
   perMinute: LiveMinute[]; // oldest first, windowMin entries
   sessions: LiveSession[]; // most recent activity first, active within 24 h
 }

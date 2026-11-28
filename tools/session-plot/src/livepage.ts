@@ -1,6 +1,8 @@
 // Browser client for /live. No external libraries; the charts are hand-built SVG.
 import { isTokenKind, minuteTokens, minuteTokenTotal, TOKEN_KIND_LABELS, tokensOf, type TokenKind } from "./tokens";
 import type { LiveMinute, LiveSession, LiveSnapshot } from "./types";
+import { fmtOutPerUsd, outPerUsd } from "./cost";
+import { stableOrder } from "./order";
 
 const CTX_LIMIT = 200_000;
 const LIVE_SEC = 120;
@@ -25,6 +27,8 @@ let subsOpen: Set<string> = loadSubsOpen();
 // Rendered card node and the HTML it was built from, per session id (see renderCards).
 const cardEls = new Map<string, HTMLElement>();
 const cardHtmls = new Map<string, string>();
+// Session ids in on-screen order, kept across snapshots (see stableOrder in src/order.ts).
+let cardOrder: string[] = [];
 // The card under a press: from pointerdown on one of its toggle buttons until release. Its DOM is kept
 // during the press, so the click that ends the press reaches the same button.
 let held: { id: string; timer: ReturnType<typeof setTimeout> } | null = null;
@@ -156,12 +160,15 @@ function registerModels(s: LiveSnapshot): void {
   add(s.perMinute.flatMap((m) => Object.keys(m.byModel)));
   add(s.sessions.flatMap((x) => x.byModel.map((b) => b.model)));
   add(s.sessions.flatMap((x) => x.activeSubagents.map((a) => a.model)));
+  add(s.sessions.flatMap((x) => (x.mainModel ? [x.mainModel] : [])));
 }
 
 function renderTotals(s: LiveSnapshot): void {
   $<HTMLElement>("tToday").textContent = usd(s.totals.costToday);
   $<HTMLElement>("tHour").textContent = usd(s.totals.costLastHour);
   $<HTMLElement>("tOut").textContent = tokens(s.totals.outLastHour);
+  $<HTMLElement>("tOpdToday").textContent = fmtOutPerUsd(outPerUsd(s.totals.outToday, s.totals.costToday));
+  $<HTMLElement>("tOpdHour").textContent = fmtOutPerUsd(outPerUsd(s.totals.outLastHour, s.totals.costLastHour));
   $<HTMLElement>("updated").textContent = `updated ${hhmmss(s.now)}`;
 }
 
@@ -346,6 +353,7 @@ function renderCards(s: LiveSnapshot): void {
     grid.innerHTML = `<p class="muted">No session activity in the last 24 h.</p>`;
     cardEls.clear();
     cardHtmls.clear();
+    cardOrder = [];
     return;
   }
   const wanted = new Set(s.sessions.map((x) => x.id));
@@ -357,7 +365,11 @@ function renderCards(s: LiveSnapshot): void {
   }
   // A toggle button with keyboard focus is replaced with its card; focus goes back to the new button.
   let refocus: { id: string; sel: string } | null = null;
-  s.sessions.forEach((x, idx) => {
+  // The order from the last snapshot is kept; sessions not seen before go on top (see stableOrder).
+  cardOrder = stableOrder(cardOrder, s.sessions);
+  const byId = new Map(s.sessions.map((x) => [x.id, x] as const));
+  const ordered = cardOrder.map((id) => byId.get(id)!);
+  ordered.forEach((x, idx) => {
     const html = cardHtml(x);
     let el = cardEls.get(x.id);
     if (!el) {
@@ -423,6 +435,8 @@ function cardHtml(x: LiveSession): string {
   const hasMain = x.mainTurns > 0;
   const pct = Math.min(100, (x.mainCtx / CTX_LIMIT) * 100);
   const level = x.mainCtx > 185_000 ? " red" : x.mainCtx > 150_000 ? " amber" : "";
+  // The gauge is filled with the main model's colour; without a main model it keeps the CSS default.
+  const gaugeStyle = `width:${pct.toFixed(1)}%` + (x.mainModel ? `;background:${colorOf(x.mainModel)}` : "");
   const subs = x.activeSubagents
     .map(
       (a) =>
@@ -453,7 +467,8 @@ function cardHtml(x: LiveSession): string {
     );
   const figures =
     `<div class="money"><span>today <b>${usd(x.costToday)}</b></span>` +
-    `<span>last hour <b>${usd(x.costLastHour)}</b></span></div>`;
+    `<span>last hour <b>${usd(x.costLastHour)}</b></span>` +
+    `<span>out/$ <b>${fmtOutPerUsd(outPerUsd(x.tokToday.out, x.costToday))}</b></span></div>`;
   // Active subagents fold into one line; the list shows only while this session is expanded.
   const nSubs = x.activeSubagents.length;
   const subsOn = nSubs > 0 && subsOpen.has(x.id);
@@ -473,8 +488,8 @@ function cardHtml(x: LiveSession): string {
     `</div>` +
     `<div class="card-ctx">` +
     `<div class="ctxrow"><span>${esc(x.mainModel ?? "main")}</span>` +
-    `<span class="mono">${hasMain ? `${kTok(x.mainCtx)} / 200k` : "—"}</span></div>` +
-    `<div class="gauge${level}"><i style="width:${pct.toFixed(1)}%"></i></div>` +
+    `<span class="mono${level}">${hasMain ? `${kTok(x.mainCtx)} / 200k` : "—"}</span></div>` +
+    `<div class="gauge"><i style="${gaugeStyle}"></i></div>` +
     `<div class="muted small">${counts}</div>` +
     `</div>` +
     `<div class="card-figs">${figures}<div class="card-bars">${bars}</div></div>` +
