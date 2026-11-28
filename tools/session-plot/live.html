@@ -118,9 +118,10 @@
   .card:hover .ctitle, .card-link:focus-visible .ctitle { text-decoration: underline; }
   .ctitle { display: block; font-weight: 600; word-break: break-word; min-width: 0; }
   .card-meta { margin-top: 2px; min-width: 0; word-break: break-word; }
-  .card-ctx { grid-column: 2 / -1; grid-row: 2; min-width: 0; }
-  .card-figs { grid-column: 2 / -1; grid-row: 3; min-width: 0; }
-  .card-subs { grid-column: 1 / -1; grid-row: 4; min-width: 0; }
+  .card-branches { grid-column: 2 / -1; grid-row: 2; position: relative; z-index: 1; min-width: 0; }
+  .card-ctx { grid-column: 2 / -1; grid-row: 3; min-width: 0; }
+  .card-figs { grid-column: 2 / -1; grid-row: 4; min-width: 0; }
+  .card-subs { grid-column: 1 / -1; grid-row: 5; min-width: 0; }
   .card .dot {
     position: relative; align-self: start; width: 9px; height: 9px; margin-top: 6px;
     border-radius: 50%; background: var(--grid);
@@ -149,6 +150,9 @@
   .subs li { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 2px 0; border-top: 1px dashed var(--grid); }
   /* Above the title link overlay so the bar tooltips work; the bars are informational, not links. */
   .card-bars { position: relative; z-index: 1; display: grid; gap: 3px; margin-top: 4px; min-width: 0; }
+  /* Branch graph: an inline SVG over the title link (z-index 1), so its tooltips work. */
+  .br-head { line-height: 1.3; min-width: 0; }
+  .branches { display: block; width: 100%; height: 44px; overflow: visible; }
   .bar-row { display: grid; grid-template-columns: 50px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 12px; }
   .bar-label { min-width: 0; }
   .bar-total { font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -174,16 +178,17 @@
   .kind-toggle button + button { border-left: 1px solid var(--grid); }
   .kind-toggle button[aria-pressed="true"] { background: var(--grid); font-weight: 600; }
   .kind-toggle button:focus-visible { outline: 2px solid var(--m1); outline-offset: -2px; }
-  /* Wide screens: one line per session. Columns: dot, title block, context, figures.
+  /* Wide screens: one line per session. Columns: dot, title block, context, branches, figures.
      The active subagents list is a second line under the row. */
   @media (min-width: 760px) {
     .card {
-      grid-template-columns: 9px minmax(0, 1fr) 220px 230px;
+      grid-template-columns: 9px minmax(160px, 1fr) 170px minmax(240px, 2fr) 230px;
       column-gap: 14px; row-gap: 4px; align-items: center;
     }
     .card .dot { align-self: center; margin-top: 0; }
     .card-ctx { grid-column: 3; grid-row: 1; }
-    .card-figs { grid-column: 4; grid-row: 1; }
+    .card-branches { grid-column: 4; grid-row: 1; align-self: center; }
+    .card-figs { grid-column: 5; grid-row: 1; }
     .card-subs { grid-column: 1 / -1; grid-row: 2; }
     .card-meta, .ctitle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; word-break: normal; }
   }

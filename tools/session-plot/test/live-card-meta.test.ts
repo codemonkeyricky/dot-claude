@@ -50,6 +50,7 @@ function session(id: string, ago: number, costToday = 1): LiveSession {
     byModel: [],
     subagentCount: 0,
     activeSubagents: [],
+    branches: { start: 0, end: 0, trunk: [], branches: [], agenticMs: 0, activeMs: 0, maxLane: 0 },
   };
 }
 
@@ -384,4 +385,26 @@ test("a model seen only today gets its own colour; existing colours stay; the le
   const second = legendColours();
   assert.equal(second.get("lh-model"), lhColour, "last-hour colour unchanged");
   assert.equal(second.get("today-only"), todayColour, "today-only colour kept");
+});
+
+test("a row with branches renders the branch graph, one path per branch, and the agentic share", async () => {
+  await loaded;
+  const branches: LiveSession["branches"] = {
+    start: T0 - 3_600_000,
+    end: T0 - 1_000,
+    trunk: [[T0 - 3_600_000, T0 - 1_000]],
+    branches: [
+      { id: "b1", label: "exec one", model: "model-a", fork: T0 - 1_800_000, merge: T0 - 1_200_000, lane: 1, active: false },
+      { id: "b2", label: "exec two", model: "model-b", fork: T0 - 600_000, merge: T0 - 1_000, lane: -1, active: true },
+    ],
+    agenticMs: 1_200_000,
+    activeMs: 2_400_000,
+    maxLane: 1,
+  };
+  push(snapshot([{ ...session("k1", 1_000), branches }]));
+  const card = w.document.querySelector<HTMLElement>(`.card[data-id="k1"]`);
+  assert.ok(card, "row rendered");
+  assert.ok(card.querySelector("svg.branches"), "row has the branch svg");
+  assert.equal(card.querySelectorAll(".br-branch").length, 2, "one path per branch");
+  assert.match(card.querySelector(".br-head")?.textContent ?? "", /agentic 50% · brainstorm 50%/);
 });

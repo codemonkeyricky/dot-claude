@@ -1,6 +1,6 @@
 // Browser client for /live. No external libraries; the charts are hand-built SVG.
 import { isTokenKind, minuteTokens, minuteTokenTotal, TOKEN_KIND_LABELS, tokensOf, type TokenKind } from "./tokens";
-import type { LiveMinute, LiveSession, LiveSnapshot } from "./types";
+import type { LiveBranches, LiveMinute, LiveSession, LiveSnapshot } from "./types";
 import { fmtOutPerUsd, outPerUsd } from "./cost";
 import { stableOrder } from "./order";
 
@@ -169,6 +169,7 @@ function registerModels(s: LiveSnapshot): void {
   add(s.sessions.flatMap((x) => x.byModel.map((b) => b.model)));
   add(s.sessions.flatMap((x) => x.activeSubagents.map((a) => a.model)));
   add(s.sessions.flatMap((x) => (x.mainModel ? [x.mainModel] : [])));
+  add(s.sessions.flatMap((x) => x.branches.branches.map((b) => b.model)));
 }
 
 // 7-day tile: the total, a hover listing of each day (oldest first, newest last) and one mini bar
@@ -397,7 +398,7 @@ function renderCards(s: LiveSnapshot): void {
   const byId = new Map(s.sessions.map((x) => [x.id, x] as const));
   const ordered = cardOrder.map((id) => byId.get(id)!);
   ordered.forEach((x, idx) => {
-    const html = cardHtml(x);
+    const html = cardHtml(x, s.now);
     let el = cardEls.get(x.id);
     if (!el) {
       el = parseCard(html);
@@ -458,7 +459,110 @@ function shareBar(kind: string, total: number, totalText: string, parts: { model
   );
 }
 
-function cardHtml(x: LiveSession): string {
+// Branch graph for a session row. Built from the snapshot alone (its branches and the server clock
+// now), so it changes only when a snapshot arrives, never on the one-second tick.
+const BR_W = 400; // viewBox width
+const BR_PITCH = 6; // px between lanes
+const BR_H = 2 * 3 * BR_PITCH + 8; // 44: three lanes each side, plus margin
+const BR_CURVE = 6; // horizontal extent of the fork and merge curves
+
+function durText(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${pad(s % 60)}s`;
+  return `${Math.floor(m / 60)}h ${pad(m % 60)}m`;
+}
+
+// Share of the session's activity that had subagents running (agentic) and the rest (brainstorm).
+function branchShare(b: LiveBranches): { p: number; q: number } | null {
+  if (b.activeMs <= 0) return null;
+  const p = Math.min(100, Math.round((b.agenticMs / b.activeMs) * 100));
+  return { p, q: 100 - p };
+}
+
+function branchHeader(x: LiveSession): string {
+  const b = x.branches;
+  const n = b.branches.length;
+  const share = branchShare(b);
+  const mix = share ? `agentic ${share.p}% · brainstorm ${share.q}%` : "agentic — · brainstorm —";
+  const folded = b.maxLane > 3 ? ` · +${b.maxLane - 3} lanes folded` : "";
+  return `Branches · ${n} subagent${n === 1 ? "" : "s"} · ${mix}${folded}`;
+}
+
+function branchesSvg(x: LiveSession, now: number): string {
+  const b = x.branches;
+  const mid = BR_H / 2;
+  // The axis runs to now while the session is recent, and to its last message once it is older.
+  const x0 = b.start;
+  let x1 = now - b.end < 3_600_000 ? now : b.end;
+  if (x1 <= x0) x1 = x0 + 1;
+  const X = (t: number): number => Math.min(BR_W, Math.max(0, ((t - x0) / (x1 - x0)) * BR_W));
+  const f = (n: number): string => n.toFixed(2);
+  const trunkColor = x.mainModel ? colorOf(x.mainModel) : "var(--muted)";
+  const out: string[] = [];
+  out.push(
+    `<line class="br-idle" x1="0" y1="${f(mid)}" x2="${BR_W}" y2="${f(mid)}" style="stroke:var(--grid)" ` +
+      `stroke-width="1" vector-effect="non-scaling-stroke"/>`,
+  );
+  for (const [a, c] of b.trunk) {
+    let xa = X(a);
+    let xc = X(c);
+    if (xc - xa < 1.5) {
+      xa = Math.min(xa, BR_W - 1.5);
+      xc = xa + 1.5;
+    }
+    out.push(
+      `<line class="br-trunk" x1="${f(xa)}" y1="${f(mid)}" x2="${f(xc)}" y2="${f(mid)}" ` +
+        `style="stroke:${trunkColor}" stroke-width="2.5" vector-effect="non-scaling-stroke"/>`,
+    );
+  }
+  for (const br of b.branches) {
+    const fx = X(br.fork);
+    const mx = X(br.merge);
+    const ly = mid - br.lane * BR_PITCH;
+    const color = br.model ? colorOf(br.model) : "var(--muted)";
+    const w = mx - fx;
+    let d: string;
+    let end = "";
+    if (w < 2 * BR_CURVE) {
+      // Too short for the curves: a straight vertical tick at the middle of the branch.
+      const cx = (fx + mx) / 2;
+      d = `M${f(cx)} ${f(mid)}L${f(cx)} ${f(ly)}`;
+      if (br.active) end = `<circle class="br-end" cx="${f(cx)}" cy="${f(ly)}" r="2" style="fill:${color}"/>`;
+    } else if (br.active) {
+      // Still running: leaves the trunk, runs flat, and ends at its lane.
+      d =
+        `M${f(fx)} ${f(mid)}C${f(fx + BR_CURVE / 2)} ${f(mid)} ${f(fx + BR_CURVE / 2)} ${f(ly)} ${f(fx + BR_CURVE)} ${f(ly)}` +
+        `L${f(mx)} ${f(ly)}`;
+      end = `<circle class="br-end" cx="${f(mx)}" cy="${f(ly)}" r="2" style="fill:${color}"/>`;
+    } else {
+      d =
+        `M${f(fx)} ${f(mid)}C${f(fx + BR_CURVE / 2)} ${f(mid)} ${f(fx + BR_CURVE / 2)} ${f(ly)} ${f(fx + BR_CURVE)} ${f(ly)}` +
+        `L${f(mx - BR_CURVE)} ${f(ly)}C${f(mx - BR_CURVE / 2)} ${f(ly)} ${f(mx - BR_CURVE / 2)} ${f(mid)} ${f(mx)} ${f(mid)}`;
+    }
+    const title = `${br.label} · ${br.model ?? "—"} · ${durText(br.merge - br.fork)}`;
+    out.push(
+      `<path class="br-branch" d="${d}" fill="none" stroke-width="1.5" style="stroke:${color}" ` +
+        `vector-effect="non-scaling-stroke"><title>${esc(title)}</title></path>${end}`,
+    );
+  }
+  const share = branchShare(b);
+  const label = `Branches: ${b.branches.length} subagents, ${share ? `agentic ${share.p}%` : "no activity"}`;
+  return (
+    `<svg class="branches" viewBox="0 0 ${BR_W} ${BR_H}" preserveAspectRatio="none" role="img" ` +
+    `aria-label="${esc(label)}">${out.join("")}</svg>`
+  );
+}
+
+function branchesBlock(x: LiveSession, now: number): string {
+  return (
+    `<div class="card-branches"><div class="br-head muted small">${esc(branchHeader(x))}</div>` +
+    `${branchesSvg(x, now)}</div>`
+  );
+}
+
+function cardHtml(x: LiveSession, now: number): string {
   const hasMain = x.mainTurns > 0;
   const pct = Math.min(100, (x.mainCtx / CTX_LIMIT) * 100);
   const level = x.mainCtx > 185_000 ? " red" : x.mainCtx > 150_000 ? " amber" : "";
@@ -513,6 +617,7 @@ function cardHtml(x: LiveSession): string {
     `<a class="card-link" href="/?session=${encodeURIComponent(x.id)}&amp;live=1"><span class="ctitle">${esc(shorten(x.title, 120))}</span></a>` +
     `<div class="muted small card-meta">${esc(x.projectDir)} · <span class="ago"></span></div>` +
     `</div>` +
+    branchesBlock(x, now) +
     `<div class="card-ctx">` +
     `<div class="ctxrow"><span>${esc(x.mainModel ?? "main")}</span>` +
     `<span class="mono${level}">${hasMain ? `${kTok(x.mainCtx)} / 200k` : "—"}</span></div>` +

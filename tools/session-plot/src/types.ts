@@ -100,6 +100,29 @@ export interface LiveSession {
   byModel: LiveModelShare[]; // today, sorted by cost descending
   subagentCount: number;
   activeSubagents: LiveSubagent[];
+  branches: LiveBranches; // main session as trunk, each subagent as a branch (see livebranches.ts)
+}
+
+// One subagent drawn as a branch: it forks off the trunk at `fork` and merges back at `merge`.
+export interface LiveBranch {
+  id: string;
+  label: string;
+  model?: string;
+  agentType?: string;
+  fork: number; // epoch ms, first message
+  merge: number; // epoch ms, last message (never before fork)
+  lane: number; // 0 is the trunk; positive lanes are drawn above it
+  active: boolean; // still running: drawn open-ended, not merged back
+}
+
+export interface LiveBranches {
+  start: number; // epoch ms of the earliest message in the session, 0 when none
+  end: number; // epoch ms of the latest message, 0 when none
+  trunk: [number, number][]; // main-session activity segments, [first, last] epoch ms
+  branches: LiveBranch[]; // sorted by fork, then id
+  agenticMs: number; // union of all subagent [fork, merge] intervals
+  activeMs: number; // union of trunk segments and subagent intervals
+  maxLane: number; // largest |lane| before clamping
 }
 
 export interface LiveSnapshot {
