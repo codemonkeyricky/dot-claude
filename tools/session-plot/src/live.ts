@@ -30,15 +30,18 @@ import type { LiveMinute, LiveModelShare, LiveSession, LiveSnapshot, LiveSubagen
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
+// Per-message retention: records and transcript files are kept for 7 days, so the 7-day cost can
+// be totalled. The session list is still limited to sessions active within DAY.
+const RETAIN = 7 * DAY;
 const ACTIVE_MS = 120_000;
 const WINDOW_MIN = 60;
 const DEBOUNCE_MS = 1000;
 const POLL_MS = 2000;
 // With no file change, the snapshot is still recomputed this often, so "last hour", the 60-minute
-// axis and the 24 h window advance on an idle machine.
+// axis and the 24 h and 7-day windows advance on an idle machine.
 const IDLE_MS = 30_000;
 
-// Per-message record, kept only while the message is inside the 24 h window (windowed totals).
+// Per-message record, kept only while the message is inside the RETAIN (7-day) window.
 interface Msg {
   t: number; // first-seen timestamp of this message id
   model: string;
@@ -87,7 +90,7 @@ interface FileState {
   mtime: number; // epoch ms at the last read
   offset: number; // bytes consumed so far
   partial: Buffer; // trailing bytes without a newline yet
-  msgs: Map<string, Msg>; // windowed per-message records (pruned to the 24 h window)
+  msgs: Map<string, Msg>; // windowed per-message records (pruned to the RETAIN window)
   seen: Map<string, Seen>; // all-time per-message records (dedupe, turns, cost)
   totalUsd: number; // all-time cost of this file
   totalTok: TokenSplit; // all-time tokens of this file, same dedupe as totalUsd
@@ -169,7 +172,7 @@ export class LiveIndex extends EventEmitter {
     const t0 = performance.now();
     // Start watching before the scan so nothing written during the scan is missed.
     this.startWatching();
-    this.walk(Date.now() - DAY);
+    this.walk(Date.now() - RETAIN);
     this.prune();
     this.latest = this.compute();
     this.firstSnapshotMs = performance.now() - t0;
@@ -191,7 +194,7 @@ export class LiveIndex extends EventEmitter {
 
   // Re-scans the tree, prunes, and recomputes the snapshot now (no debounce, no event).
   refreshNow(): LiveSnapshot {
-    this.walk(Date.now() - DAY);
+    this.walk(Date.now() - RETAIN);
     this.prune();
     this.latest = this.compute();
     return this.latest;
@@ -234,12 +237,12 @@ export class LiveIndex extends EventEmitter {
     if (this.poller) return;
     this.watcher?.close();
     this.watcher = null;
-    this.poller = setInterval(() => this.noteChanged(this.walk(Date.now() - DAY)), POLL_MS);
+    this.poller = setInterval(() => this.noteChanged(this.walk(Date.now() - RETAIN)), POLL_MS);
   }
 
   private onWatch(filename: string | Buffer | null): void {
     if (!filename) {
-      this.noteChanged(this.walk(Date.now() - DAY));
+      this.noteChanged(this.walk(Date.now() - RETAIN));
       return;
     }
     const rel = filename.toString();
@@ -283,14 +286,15 @@ export class LiveIndex extends EventEmitter {
     this.emit("update", update);
   }
 
-  // Only msgs (the per-message records behind the per-minute buckets) is bounded to the 24 h window:
-  // entries older than the cutoff are dropped. The seen map, totals, peak and last message are
-  // all-time per live session and are not pruned while the session is live, so their memory is
-  // bounded per session, not per 24 h. A session is live while any of its files was written inside
-  // the window, and all of its files are kept with it. A session whose files are all older than the
-  // cutoff is dropped, and walk() does not re-add it because its files are out of window and untracked.
+  // Only msgs (the per-message records behind the per-minute buckets and the 7-day totals) is bounded
+  // to the RETAIN window: entries older than the cutoff are dropped. The seen map, totals, peak and
+  // last message are all-time per live session and are not pruned while the session is live, so
+  // their memory is bounded per session, not per window. A session is live while any of its files
+  // was written inside the window, and all of its files are kept with it. A session whose files are
+  // all older than the cutoff is dropped, and walk() does not re-add it because its files are out of
+  // window and untracked.
   private prune(): void {
-    const cutoff = Date.now() - DAY;
+    const cutoff = Date.now() - RETAIN;
     for (const st of this.files.values()) {
       for (const [key, m] of st.msgs) if (m.t < cutoff) st.msgs.delete(key);
     }
@@ -580,8 +584,8 @@ export class LiveIndex extends EventEmitter {
     // Synthetic placeholders (model "<...>") never become the session's latest message.
     if (!model.startsWith("<") && (st.last === null || t >= st.last.t)) st.last = { t, model, ctx };
 
-    // Windowed record: only messages inside the 24 h window are kept per message.
-    if (t >= Date.now() - DAY) st.msgs.set(key, { t, model, in: input, cw, cr, out, ctx, usd });
+    // Windowed record: only messages inside the 7-day retention window are kept per message.
+    if (t >= Date.now() - RETAIN) st.msgs.set(key, { t, model, in: input, cw, cr, out, ctx, usd });
   }
 
   private loadMeta(st: FileState): void {
@@ -606,13 +610,36 @@ export class LiveIndex extends EventEmitter {
       t: winStart + i * MINUTE,
       byModel: {},
     }));
-    const totals = { costToday: 0, costLastHour: 0, outLastHour: 0, outToday: 0 };
+    // Seven calendar days ending today, oldest first. Each start is a local midnight from the Date
+    // constructor, so a DST change inside the week does not move a day boundary.
+    const dayStarts = Array.from(
+      { length: 7 },
+      (_, i) => new Date(d.getFullYear(), d.getMonth(), d.getDate() - (6 - i)).getTime(),
+    );
+    const costByDay = dayStarts.map((day) => ({ day, cost: 0 }));
+    // Index of the day that holds t: the last day start at or before t (times after today's
+    // midnight, including any clock skew, fall in today). Only called for t >= dayStarts[0].
+    const dayIndex = (t: number): number => {
+      let i = dayStarts.length - 1;
+      while (i > 0 && t < dayStarts[i]) i--;
+      return i;
+    };
+    const totals: LiveSnapshot["totals"] = { costToday: 0, costLastHour: 0, outLastHour: 0, outToday: 0, cost7d: 0, costByDay };
     const sessions: LiveSession[] = [];
 
     for (const sess of this.sessions.values()) {
       const files = sessionFiles(sess);
       let lastActivity = 0;
       for (const f of files) lastActivity = Math.max(lastActivity, f.lastActivity);
+
+      // 7-day totals cover every retained session, including those too old for the 24 h list.
+      // Today's bucket gets the same messages in the same order as costToday below, so the two match.
+      for (const f of files) {
+        for (const m of f.msgs.values()) {
+          if (m.model.startsWith("<") || m.t < dayStarts[0]) continue; // synthetic, or before the week
+          costByDay[dayIndex(m.t)].cost += m.usd;
+        }
+      }
       if (lastActivity < dayAgo) continue;
 
       let costToday = 0;
@@ -706,6 +733,8 @@ export class LiveIndex extends EventEmitter {
     }
 
     sessions.sort((a, b) => b.lastActivity - a.lastActivity);
+    // Summed from costByDay so cost7d equals the sum of the per-day figures exactly.
+    totals.cost7d = costByDay.reduce((sum, b) => sum + b.cost, 0);
     return { now, windowMin: WINDOW_MIN, totals, perMinute, sessions };
   }
 }

@@ -66,7 +66,9 @@ function subagent(id: string, ago: number): LiveSession["activeSubagents"][numbe
 }
 
 function snapshot(sessions: LiveSession[]): LiveSnapshot {
-  return { now: Date.now(), windowMin: 60, totals: { costToday: 1, costLastHour: 0.5, outLastHour: 2, outToday: 3 }, perMinute: [], sessions };
+  const costByDay = [0, 0, 0, 0, 0, 0, 1].map((cost) => ({ day: 0, cost }));
+  const totals = { costToday: 1, costLastHour: 0.5, outLastHour: 2, outToday: 3, cost7d: 1, costByDay };
+  return { now: Date.now(), windowMin: 60, totals, perMinute: [], sessions };
 }
 
 function push(s: LiveSnapshot): void {

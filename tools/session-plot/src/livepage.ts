@@ -59,6 +59,14 @@ function usd(n: number): string {
   return `$${n.toFixed(2)}`;
 }
 
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// "Sat 11-22" for the local calendar day that starts at t.
+function dayLabel(t: number): string {
+  const d = new Date(t);
+  return `${WEEKDAYS[d.getDay()]} ${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function tokens(n: number): string {
   if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
@@ -163,7 +171,26 @@ function registerModels(s: LiveSnapshot): void {
   add(s.sessions.flatMap((x) => (x.mainModel ? [x.mainModel] : [])));
 }
 
+// 7-day tile: the total, a hover listing of each day (oldest first, newest last) and one mini bar
+// per day, scaled to the busiest day. Today's bar is the last one and gets the highlight class.
+function renderWeek(s: LiveSnapshot): void {
+  const days = s.totals.costByDay;
+  const max = Math.max(0, ...days.map((x) => x.cost));
+  const last = days.length - 1;
+  const lines = days.map((x) => `${dayLabel(x.day)}  ${usd(x.cost)}`);
+  $<HTMLElement>("t7d").textContent = usd(s.totals.cost7d);
+  $<HTMLElement>("tWeek").title = lines.join("\n");
+  $<HTMLElement>("tWeekBars").innerHTML = days
+    .map((x, i) => {
+      const pct = max > 0 ? (x.cost / max) * 100 : 0;
+      const cls = i === last ? ' class="wk-today"' : "";
+      return `<i${cls} style="height:${pct.toFixed(1)}%" title="${esc(lines[i])}"></i>`;
+    })
+    .join("");
+}
+
 function renderTotals(s: LiveSnapshot): void {
+  renderWeek(s);
   $<HTMLElement>("tToday").textContent = usd(s.totals.costToday);
   $<HTMLElement>("tHour").textContent = usd(s.totals.costLastHour);
   $<HTMLElement>("tOut").textContent = tokens(s.totals.outLastHour);
