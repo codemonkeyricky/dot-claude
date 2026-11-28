@@ -186,7 +186,8 @@ test("pruning per-message records leaves the all-time turns, peak and subagent c
   const subDir = join(dir, SID, "subagents");
   mkdirSync(subDir, { recursive: true });
   const subFile = join(subDir, "agent-sub2.jsonl");
-  const oldTs = new Date(Date.now() - 2 * DAY).toISOString();
+  // Older than the 7-day retention window, so the per-message store drops it.
+  const oldTs = new Date(Date.now() - 8 * DAY).toISOString();
   writeFileSync(file, usageLine("old-main", 1000, oldTs) + usageLine("new-main", 5000));
   writeFileSync(subFile, usageLine("old-sub", 300, oldTs) + usageLine("new-sub", 700));
   const idx = new LiveIndex(root);
@@ -248,13 +249,13 @@ test("an idle main transcript is kept while a subagent is active, and a poll doe
   }
 });
 
-test("a session whose files are all older than 24 h is dropped and not re-added by a poll", () => {
+test("a session whose files are all older than the 7-day retention window is dropped and not re-added by a poll", () => {
   const { root, file } = fixture();
   writeFileSync(file, usageLine("m1", 100));
   const idx = new LiveIndex(root);
   try {
     assert.equal(idx.sessionCount(), 1);
-    const old = new Date(Date.now() - 2 * DAY);
+    const old = new Date(Date.now() - 8 * DAY);
     utimesSync(file, old, old);
     idx.refreshNow();
     assert.equal(idx.sessionCount(), 0);

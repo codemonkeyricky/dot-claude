@@ -83,6 +83,10 @@
   .tot { background: var(--panel); border: 1px solid var(--grid); border-radius: 8px; padding: 8px 10px; min-width: 0; }
   .tot span { display: block; font-size: 12px; }
   .tot b { font-size: 20px; font-variant-numeric: tabular-nums; }
+  /* 7-day mini chart in the "7 days" tile: one bar per calendar day, oldest first, today highlighted. */
+  .wk-bars { display: flex; align-items: flex-end; gap: 2px; height: 16px; margin-top: 4px; }
+  .wk-bars i { display: block; width: 7px; min-height: 1px; border-radius: 1px; background: var(--muted); opacity: 0.5; }
+  .wk-bars i.wk-today { background: var(--m1); opacity: 1; }
 
   .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 4px 0; font-size: 13px; }
   .legend span { display: inline-flex; align-items: center; gap: 6px; }
@@ -201,6 +205,7 @@
 
   <section class="totals" aria-label="Totals">
     <div class="tot"><span class="muted">$ today</span><b id="tToday">—</b></div>
+    <div class="tot" id="tWeek"><span class="muted">7 days</span><b id="t7d">—</b><div id="tWeekBars" class="wk-bars" aria-hidden="true"></div></div>
     <div class="tot"><span class="muted">$ last hour</span><b id="tHour">—</b></div>
     <div class="tot"><span class="muted">output tokens, last hour</span><b id="tOut">—</b></div>
     <div class="tot"><span class="muted">out/$ today</span><b id="tOpdToday">—</b></div>

@@ -105,7 +105,14 @@ export interface LiveSession {
 export interface LiveSnapshot {
   now: number; // epoch ms, server clock
   windowMin: number;
-  totals: { costToday: number; costLastHour: number; outLastHour: number; outToday: number };
+  totals: {
+    costToday: number;
+    costLastHour: number;
+    outLastHour: number;
+    outToday: number;
+    cost7d: number; // sum of costByDay: 7 calendar days including today, API list price
+    costByDay: { day: number; cost: number }[]; // exactly 7, oldest first; day = local midnight (epoch ms)
+  };
   perMinute: LiveMinute[]; // oldest first, windowMin entries
-  sessions: LiveSession[]; // most recent activity first, active within 24 h
+  sessions: LiveSession[]; // most recent activity first, active within 24 h (totals cover 7 days)
 }

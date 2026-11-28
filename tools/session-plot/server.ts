@@ -16,7 +16,7 @@ const PORT = Number.isInteger(envPort) && envPort > 0 && envPort < 65536 ? envPo
 const live = new LiveIndex();
 console.log(
   `live index: first snapshot in ${live.firstSnapshotMs.toFixed(0)} ms ` +
-    `(${live.sessionCount()} sessions, ${live.fileCount()} transcript files, last 24 h)`,
+    `(${live.sessionCount()} sessions, ${live.fileCount()} transcript files, last 7 d)`,
 );
 
 function send(res: ServerResponse, status: number, body: string, type: string): void {
