@@ -1,7 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import pricing from "../pricing.json" with { type: "json" };
-import { cacheSplit, priceFor, turnCost } from "../src/cost";
+import { cacheSplit, fmtOutPerUsd, outPerUsd, priceFor, turnCost } from "../src/cost";
+
+test("outPerUsd divides output tokens by list-price dollars", () => {
+  const v = outPerUsd(764805, 16.97);
+  assert.ok(v !== null && Math.abs(v - 45068.06) < 0.01, String(v));
+  assert.equal(outPerUsd(100, 0), null);
+  assert.equal(outPerUsd(0, 1), 0);
+  assert.equal(outPerUsd(100, -1), null);
+  assert.equal(outPerUsd(Number.NaN, 1), null);
+});
+
+test("fmtOutPerUsd formats with thousands separators and dash for null", () => {
+  assert.equal(fmtOutPerUsd(null), "—");
+  assert.equal(fmtOutPerUsd(45072.4), "45,072");
+});
 
 type Rates = {
   in: number;

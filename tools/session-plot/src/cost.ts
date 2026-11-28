@@ -102,3 +102,15 @@ export function turnCost(model: string | undefined, usage: Record<string, unknow
     1e6;
   return { usd, unpriced: false };
 }
+
+// Output tokens per API-list-price dollar. Null when the cost is zero/unknown or inputs are not finite.
+export function outPerUsd(outTokens: number, usd: number): number | null {
+  if (!Number.isFinite(outTokens) || !Number.isFinite(usd) || usd <= 0) return null;
+  return outTokens / usd;
+}
+
+// Table/tooltip/status text: "—" for null, else whole number with thousands separators.
+export function fmtOutPerUsd(v: number | null): string {
+  if (v === null) return "—";
+  return Math.round(v).toLocaleString("en-US");
+}

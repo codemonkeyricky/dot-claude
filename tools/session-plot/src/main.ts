@@ -2,6 +2,7 @@
 import { branchLanes } from "./branches";
 import { LatestRequest } from "./latest";
 import type { Kind, Series, SessionData, SessionSummary } from "./types";
+import { fmtOutPerUsd, outPerUsd } from "./cost";
 
 declare global {
   interface Window {
@@ -382,7 +383,7 @@ function renderTable(d: SessionData): void {
   const rows = [d.main, ...d.subagents];
   const head =
     `<tr><th>Label</th><th>Kind</th><th>Model</th><th>Spawn</th><th>Duration</th>` +
-    `<th class="n">Turns</th><th class="n">Peak ctx (k)</th><th class="n">Output (k)</th><th class="n">Cost $</th></tr>`;
+    `<th class="n">Turns</th><th class="n">Peak ctx (k)</th><th class="n">Output (k)</th><th class="n">Cost $</th><th class="n">Out/$</th></tr>`;
   const body = rows
     .map(
       (s) =>
@@ -396,6 +397,7 @@ function renderTable(d: SessionData): void {
         `<td class="n">${kTok(s.peakCtx)}</td>` +
         `<td class="n">${kTok(s.outputTokens)}</td>` +
         `<td class="n">${s.costUsd.toFixed(2)}</td>` +
+        `<td class="n">${fmtOutPerUsd(outPerUsd(s.outputTokens, s.costUsd))}</td>` +
         `</tr>`,
     )
     .join("");
@@ -411,6 +413,7 @@ function tipHtml(s: Series): string {
   lines.push(`duration: ${dur(s.end - s.start)}`);
   lines.push(`turns: ${s.turns} · peak ctx: ${kTok(s.peakCtx)}k · output: ${kTok(s.outputTokens)}k`);
   lines.push(`cost: ${usd(s.costUsd)} (API list price)`);
+  lines.push(`out/$: ${fmtOutPerUsd(outPerUsd(s.outputTokens, s.costUsd))}`);
   return lines.join("<br>");
 }
 
@@ -484,10 +487,11 @@ function renderSession(d: SessionData): void {
   renderLegend();
   renderChart(d);
   renderTable(d);
-  const unpriced = d.unpricedModels.length > 0 ? ` · unpriced: ${d.unpricedModels.join(", ")}` : "";
+  const totalOut = d.main.outputTokens + d.subagents.reduce((a, s) => a + s.outputTokens, 0);
+  const unpriced =d.unpricedModels.length > 0 ? ` · unpriced: ${d.unpricedModels.join(", ")}` : "";
   setStatus(
     `${d.subagents.length} subagents · ${d.compactions.length} compactions · ${d.main.turns} main turns · ` +
-      `${usd(d.totalCostUsd)} total (API list price)${unpriced}`,
+      `${usd(d.totalCostUsd)} total (API list price) · ${fmtOutPerUsd(outPerUsd(totalOut, d.totalCostUsd))} out/$${unpriced}`,
   );
   restoreHover();
 }
