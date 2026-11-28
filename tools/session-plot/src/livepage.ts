@@ -1,6 +1,7 @@
 // Browser client for /live. No external libraries; the charts are hand-built SVG.
 import { isTokenKind, minuteTokens, minuteTokenTotal, TOKEN_KIND_LABELS, tokensOf, type TokenKind } from "./tokens";
 import type { LiveBranches, LiveMinute, LiveSession, LiveSnapshot } from "./types";
+import { compressAxis } from "./livebranches";
 import { fmtOutPerUsd, outPerUsd } from "./cost";
 import { stableOrder } from "./order";
 
@@ -474,30 +475,63 @@ function durText(ms: number): string {
   return `${Math.floor(m / 60)}h ${pad(m % 60)}m`;
 }
 
-// Share of the session's activity that had subagents running (agentic) and the rest (brainstorm).
+// Turn-based share: main turns that ran while a subagent was working (agentic) and the rest (talk).
 function branchShare(b: LiveBranches): { p: number; q: number } | null {
-  if (b.activeMs <= 0) return null;
-  const p = Math.min(100, Math.round((b.agenticMs / b.activeMs) * 100));
+  if (b.mainTurns <= 0) return null;
+  const p = Math.min(100, Math.round((b.agenticTurns / b.mainTurns) * 100));
   return { p, q: 100 - p };
+}
+
+// The model most subagents ran on (the first one to reach the top count); the agentic segment uses it.
+function branchModel(b: LiveBranches): string | undefined {
+  const count = new Map<string, number>();
+  let best: string | undefined;
+  let bestN = 0;
+  for (const br of b.branches) {
+    if (!br.model) continue;
+    const n = (count.get(br.model) ?? 0) + 1;
+    count.set(br.model, n);
+    if (n > bestN) {
+      best = br.model;
+      bestN = n;
+    }
+  }
+  return best;
 }
 
 function branchHeader(x: LiveSession): string {
   const b = x.branches;
   const n = b.branches.length;
   const share = branchShare(b);
-  const mix = share ? `agentic ${share.p}% · brainstorm ${share.q}%` : "agentic — · brainstorm —";
+  const mix = share ? `agentic ${share.p}% · talk ${share.q}%` : "agentic — · talk —";
   const folded = b.maxLane > 3 ? ` · +${b.maxLane - 3} lanes folded` : "";
   return `Branches · ${n} subagent${n === 1 ? "" : "s"} · ${mix}${folded}`;
+}
+
+// Two-segment ratio bar, 60x6 px: the agentic share in the subagents' model colour, the talk share
+// in the main model's colour. Empty when there are no main turns.
+function branchRatio(x: LiveSession): string {
+  const b = x.branches;
+  const share = branchShare(b);
+  if (!share) return "";
+  const agentic = branchModel(b);
+  const agenticColor = agentic ? colorOf(agentic) : "var(--muted)";
+  const talkColor = x.mainModel ? colorOf(x.mainModel) : "var(--grid)";
+  const title = `${b.agenticTurns} of ${b.mainTurns} main turns ran while subagents were working`;
+  return (
+    `<span class="br-ratio" title="${esc(title)}"><i style="width:${share.p}%;background:${agenticColor}"></i>` +
+    `<i style="width:${share.q}%;background:${talkColor}"></i></span>`
+  );
 }
 
 function branchesSvg(x: LiveSession, now: number): string {
   const b = x.branches;
   const mid = BR_H / 2;
   // The axis runs to now while the session is recent, and to its last message once it is older.
-  const x0 = b.start;
-  let x1 = now - b.end < 3_600_000 ? now : b.end;
-  if (x1 <= x0) x1 = x0 + 1;
-  const X = (t: number): number => Math.min(BR_W, Math.max(0, ((t - x0) / (x1 - x0)) * BR_W));
+  const x1 = now - b.end < 3_600_000 ? now : b.end;
+  // Long idle gaps are compressed to a fixed-width break; every x below goes through this mapper.
+  const axis = compressAxis(b, x1);
+  const X = axis.x;
   const f = (n: number): string => n.toFixed(2);
   const trunkColor = x.mainModel ? colorOf(x.mainModel) : "var(--muted)";
   const out: string[] = [];
@@ -505,6 +539,12 @@ function branchesSvg(x: LiveSession, now: number): string {
     `<line class="br-idle" x1="0" y1="${f(mid)}" x2="${BR_W}" y2="${f(mid)}" style="stroke:var(--grid)" ` +
       `stroke-width="1" vector-effect="non-scaling-stroke"/>`,
   );
+  for (const bx of axis.breaks) {
+    out.push(
+      `<path class="br-break" d="M${f(bx - 3)} ${f(mid + 4)}L${f(bx - 1)} ${f(mid - 4)}M${f(bx + 1)} ${f(mid + 4)}L${f(bx + 3)} ${f(mid - 4)}" ` +
+        `fill="none" stroke-width="1" style="stroke:var(--muted)" vector-effect="non-scaling-stroke"/>`,
+    );
+  }
   for (const [a, c] of b.trunk) {
     let xa = X(a);
     let xc = X(c);
@@ -556,8 +596,10 @@ function branchesSvg(x: LiveSession, now: number): string {
 }
 
 function branchesBlock(x: LiveSession, now: number): string {
+  const head = branchHeader(x);
   return (
-    `<div class="card-branches"><div class="br-head muted small">${esc(branchHeader(x))}</div>` +
+    `<div class="card-branches"><div class="br-head muted small">` +
+    `<span class="br-text" title="${esc(head)}">${esc(head)}</span>${branchRatio(x)}</div>` +
     `${branchesSvg(x, now)}</div>`
   );
 }
@@ -603,24 +645,27 @@ function cardHtml(x: LiveSession, now: number): string {
   // Active subagents fold into one line; the list shows only while this session is expanded.
   const nSubs = x.activeSubagents.length;
   const subsOn = nSubs > 0 && subsOpen.has(x.id);
-  const subsBlock =
+  // The toggle sits under the title line; the expanded list is a full-width row below the figures.
+  const toggle =
     nSubs === 0
       ? ""
-      : `<div class="card-subs"><button type="button" class="subs-toggle" aria-expanded="${String(subsOn)}">` +
-        `${subsOn ? "▾" : "▸"} ${nSubs} active subagent${nSubs === 1 ? "" : "s"}</button>` +
-        (subsOn ? `<ul class="subs">${subs}</ul>` : "") +
-        `</div>`;
+      : `<button type="button" class="subs-toggle" aria-expanded="${String(subsOn)}">` +
+        `${subsOn ? "▾" : "▸"} ${nSubs} active subagent${nSubs === 1 ? "" : "s"}</button>`;
+  const subsBlock = subsOn ? `<div class="card-subs"><ul class="subs">${subs}</ul></div>` : "";
+  const modelFull = x.mainModel ?? "main";
+  const modelShort = modelFull.replace(/^claude-/, "");
   return (
     `<div class="card" data-id="${esc(x.id)}" data-last="${x.lastActivity}">` +
     `<span class="dot" aria-hidden="true"></span>` +
     `<div class="card-main">` +
     `<a class="card-link" href="/?session=${encodeURIComponent(x.id)}&amp;live=1"><span class="ctitle">${esc(shorten(x.title, 120))}</span></a>` +
     `<div class="muted small card-meta">${esc(x.projectDir)} · <span class="ago"></span></div>` +
+    toggle +
     `</div>` +
     branchesBlock(x, now) +
     `<div class="card-ctx">` +
-    `<div class="ctxrow"><span>${esc(x.mainModel ?? "main")}</span>` +
-    `<span class="mono${level}">${hasMain ? `${kTok(x.mainCtx)} / 200k` : "—"}</span></div>` +
+    `<div class="ctxrow"><span title="${esc(modelFull)}">${esc(modelShort)}</span>` +
+    `<span class="mono${level}">${hasMain ? `${kTok(x.mainCtx)}/200k` : "—"}</span></div>` +
     `<div class="gauge"><i style="${gaugeStyle}"></i></div>` +
     `<div class="muted small">${counts}</div>` +
     `</div>` +

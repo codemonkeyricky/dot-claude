@@ -123,6 +123,8 @@ export interface LiveBranches {
   agenticMs: number; // union of all subagent [fork, merge] intervals
   activeMs: number; // union of trunk segments and subagent intervals
   maxLane: number; // largest |lane| before clamping
+  mainTurns: number; // main-session messages (the trunk's turns)
+  agenticTurns: number; // main turns that ran while at least one subagent was working
 }
 
 export interface LiveSnapshot {

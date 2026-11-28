@@ -50,7 +50,7 @@ function session(id: string, ago: number, costToday = 1): LiveSession {
     byModel: [],
     subagentCount: 0,
     activeSubagents: [],
-    branches: { start: 0, end: 0, trunk: [], branches: [], agenticMs: 0, activeMs: 0, maxLane: 0 },
+    branches: { start: 0, end: 0, trunk: [], branches: [], agenticMs: 0, activeMs: 0, maxLane: 0, mainTurns: 0, agenticTurns: 0 },
   };
 }
 
@@ -400,11 +400,15 @@ test("a row with branches renders the branch graph, one path per branch, and the
     agenticMs: 1_200_000,
     activeMs: 2_400_000,
     maxLane: 1,
+    mainTurns: 4,
+    agenticTurns: 2,
   };
   push(snapshot([{ ...session("k1", 1_000), branches }]));
   const card = w.document.querySelector<HTMLElement>(`.card[data-id="k1"]`);
   assert.ok(card, "row rendered");
   assert.ok(card.querySelector("svg.branches"), "row has the branch svg");
   assert.equal(card.querySelectorAll(".br-branch").length, 2, "one path per branch");
-  assert.match(card.querySelector(".br-head")?.textContent ?? "", /agentic 50% · brainstorm 50%/);
+  assert.match(card.querySelector(".br-head")?.textContent ?? "", /agentic 50% · talk 50%/);
+  assert.ok(card.querySelector(".br-head .br-ratio"), "row has the ratio bar");
+  assert.equal(card.querySelector(".br-ratio")?.getAttribute("title"), "2 of 4 main turns ran while subagents were working");
 });

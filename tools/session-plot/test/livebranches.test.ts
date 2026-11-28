@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildLiveBranches, mergeSpans, spanTotal, type BranchSource } from "../src/livebranches";
+import { AXIS_W, buildLiveBranches, compressAxis, mergeSpans, spanTotal, type BranchSource } from "../src/livebranches";
 
 const MIN = 60_000;
 const NOW = 1_000_000_000;
@@ -9,14 +9,15 @@ function sub(id: string, times: number[], extra: Partial<BranchSource> = {}): Br
   return { id, label: id, times, ...extra };
 }
 
-test("a gap exactly equal to idleGapMs stays one trunk segment", () => {
-  const b = buildLiveBranches([0, 5 * MIN, 10 * MIN], [], NOW);
-  assert.deepEqual(b.trunk, [[0, 10 * MIN]]);
+test("a gap exactly equal to idleGapMs (10 min by default) stays one trunk segment", () => {
+  const b = buildLiveBranches([0, 10 * MIN, 20 * MIN], [], NOW);
+  assert.deepEqual(b.trunk, [[0, 20 * MIN]]);
 });
 
-test("a gap longer than idleGapMs splits the trunk", () => {
-  const b = buildLiveBranches([0, 5 * MIN + 1, 10 * MIN + 1], [], NOW);
-  assert.deepEqual(b.trunk, [[0, 0], [5 * MIN + 1, 10 * MIN + 1]]);
+test("a gap longer than idleGapMs (10 min by default) splits the trunk", () => {
+  const b = buildLiveBranches([0, 10 * MIN + 1, 20 * MIN + 2], [], NOW);
+  // Both gaps (10 min + 1 ms, and 10 min + 1 ms) are longer than idleGapMs, so three segments.
+  assert.deepEqual(b.trunk, [[0, 0], [10 * MIN + 1, 10 * MIN + 1], [20 * MIN + 2, 20 * MIN + 2]]);
 });
 
 test("a lone trunk time gives a [t,t] segment", () => {
@@ -98,6 +99,8 @@ test("empty input gives zeros", () => {
     agenticMs: 0,
     activeMs: 0,
     maxLane: 0,
+    mainTurns: 0,
+    agenticTurns: 0,
   });
 });
 
@@ -111,4 +114,58 @@ test("mergeSpans joins touching and overlapping spans and spanTotal measures the
   assert.deepEqual(mergeSpans([[5, 10], [0, 5], [20, 30]]), [[0, 10], [20, 30]]);
   assert.equal(spanTotal([[0, 10], [5, 12], [20, 25]]), 17);
   assert.equal(spanTotal([]), 0);
+});
+
+test("a main-only session has zero agentic turns", () => {
+  const b = buildLiveBranches([0, MIN, 2 * MIN], [], NOW);
+  assert.equal(b.mainTurns, 3);
+  assert.equal(b.agenticTurns, 0);
+});
+
+test("main turns inside a subagent interval are agentic, the others are talk", () => {
+  // Subagent [10, 20]: the turns at 10, 15 and 20 ran while it worked; 5 and 25 did not.
+  const b = buildLiveBranches([5, 10, 15, 20, 25], [sub("a", [10, 20])], NOW);
+  assert.equal(b.mainTurns, 5);
+  assert.equal(b.agenticTurns, 3);
+});
+
+test("a main turn exactly at a subagent's fork or merge time counts as agentic", () => {
+  const b = buildLiveBranches([100, 200], [sub("a", [100, 200])], NOW);
+  assert.equal(b.agenticTurns, 2);
+});
+
+test("an active subagent covers the activeMs window before now", () => {
+  // The subagent's last message is 30 s ago, so it is active and covers [NOW-120 s, NOW].
+  const b = buildLiveBranches([NOW - 60_000, NOW - 400_000], [sub("a", [NOW - 30_000])], NOW, { activeMs: 120_000 });
+  assert.equal(b.agenticTurns, 1);
+});
+
+test("compressAxis is monotonic and stays within [0, AXIS_W]", () => {
+  const b = buildLiveBranches([0, MIN, 60 * MIN, 61 * MIN], [], NOW);
+  const { x } = compressAxis(b, 61 * MIN);
+  let prev = -Infinity;
+  for (let t = -5 * MIN; t <= 70 * MIN; t += 0.5 * MIN) {
+    const px = x(t);
+    assert.ok(px >= 0 && px <= AXIS_W, `x(${t}) = ${px} is within the axis`);
+    assert.ok(px >= prev, `x is non-decreasing at ${t}`);
+    prev = px;
+  }
+});
+
+test("a gap within breakMs stays linear: no break mark, and time maps proportionally", () => {
+  const b = buildLiveBranches([0, 2 * MIN, 4 * MIN], [], NOW);
+  const axis = compressAxis(b, 4 * MIN);
+  assert.deepEqual(axis.breaks, []);
+  assert.equal(axis.x(2 * MIN), AXIS_W / 2);
+});
+
+test("a gap longer than breakMs is drawn at a fixed width and gets one break mark", () => {
+  // Trunk [0,1 min] and [60 min, 61 min]: the 59 min gap is compressed to 3% of the axis.
+  const b = buildLiveBranches([0, MIN, 60 * MIN, 61 * MIN], [], NOW);
+  const axis = compressAxis(b, 61 * MIN);
+  assert.equal(axis.breaks.length, 1);
+  const gapPx = axis.x(60 * MIN) - axis.x(MIN);
+  assert.ok(Math.abs(gapPx - 0.03 * AXIS_W) < 1e-9, `gap is ${gapPx} px`);
+  // The break mark sits in the middle of the gap.
+  assert.ok(Math.abs(axis.breaks[0] - (axis.x(MIN) + gapPx / 2)) < 1e-9);
 });
