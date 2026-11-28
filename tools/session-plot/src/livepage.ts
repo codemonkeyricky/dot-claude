@@ -499,13 +499,14 @@ function branchModel(b: LiveBranches): string | undefined {
   return best;
 }
 
+// Visible header text, shown after the ratio bar. The full "Branches · …" wording is the tooltip.
 function branchHeader(x: LiveSession): string {
   const b = x.branches;
   const n = b.branches.length;
   const share = branchShare(b);
   const mix = share ? `agentic ${share.p}% · talk ${share.q}%` : "agentic — · talk —";
   const folded = b.maxLane > 3 ? ` · +${b.maxLane - 3} lanes folded` : "";
-  return `Branches · ${n} subagent${n === 1 ? "" : "s"} · ${mix}${folded}`;
+  return `${n} sub${n === 1 ? "" : "s"} · ${mix}${folded}`;
 }
 
 // Two-segment ratio bar, 60x6 px: the agentic share in the subagents' model colour, the talk share
@@ -598,8 +599,8 @@ function branchesSvg(x: LiveSession, now: number): string {
 function branchesBlock(x: LiveSession, now: number): string {
   const head = branchHeader(x);
   return (
-    `<div class="card-branches"><div class="br-head muted small">` +
-    `<span class="br-text" title="${esc(head)}">${esc(head)}</span>${branchRatio(x)}</div>` +
+    `<div class="card-branches"><div class="br-head muted small">${branchRatio(x)}` +
+    `<span class="br-text" title="${esc(`Branches · ${head}`)}">${esc(head)}</span></div>` +
     `${branchesSvg(x, now)}</div>`
   );
 }
